@@ -997,6 +997,7 @@ navigation_page = st.sidebar.radio(
         "Campaign Overview",
         "Data Quality / Reconciliation",
         "Monthly Trends",
+        "Pacing & Delivery Analyzer",
         "Audience Analyzer",
         "Creative Analyzer",
         "Inventory Analyzer",
@@ -2066,7 +2067,12 @@ def aggregate_dimension_performance(
             View_Through_Conversions=("Conv_View_Through", "sum"),
             Click_Through_Conversions=("Conv_Click_Through", "sum"),
             Revenue=("Revenue_Attributed_USD", "sum"),
-            Completion_Weighted=("_completion_weighted", "sum")
+            Completion_Weighted=("_completion_weighted", "sum"),
+            Active_Days=("Date", "nunique"),
+            Data_Quality_Warnings=(
+                "Data_Quality_Status",
+                lambda values: int((values.astype(str) == "Warning").sum())
+            )
         )
     )
 
@@ -2199,6 +2205,272 @@ def aggregate_dimension_performance(
     return grouped
 
 
+
+
+# ---------------------------------------------------
+# DECISION SUPPORT: EVIDENCE, GUARDRAILS, EXPLAINABILITY
+# ---------------------------------------------------
+# TradeIQ does not treat an index crossing a threshold as sufficient evidence
+# for a high-risk optimization. Every recommendation is enriched with:
+#   1) Evidence Strength / minimum-volume rules
+#   2) Primary + Secondary KPI + ROAS guardrails
+#   3) Signal -> Interpretation -> Action -> Risk reasoning
+# These fields are shared by all analyzers and the Optimization Action Center.
+
+LOWER_IS_BETTER_KPIS = {"CPA", "CPM", "CPC"}
+
+
+def evaluate_kpi_guardrail(metric_name, actual_value, goal_value):
+    """Return PASS / CONDITIONAL / FAIL / NOT AVAILABLE for one KPI goal."""
+    if metric_name is None or goal_value is None:
+        return "NOT REQUIRED"
+
+    if actual_value is None or pd.isna(actual_value) or not np.isfinite(float(actual_value)):
+        return "NOT AVAILABLE"
+
+    actual_value = float(actual_value)
+    goal_value = float(goal_value)
+
+    if metric_name in LOWER_IS_BETTER_KPIS:
+        if actual_value <= goal_value:
+            return "PASS"
+        if actual_value <= goal_value * 1.10:
+            return "CONDITIONAL"
+        return "FAIL"
+
+    if actual_value >= goal_value:
+        return "PASS"
+    if actual_value >= goal_value * 0.90:
+        return "CONDITIONAL"
+    return "FAIL"
+
+
+def compute_evidence_strength(row):
+    """
+    Conservative minimum-evidence rules.
+
+    This is intentionally called Evidence Strength rather than statistical
+    confidence because the rule is based on observed volume, allocation, and
+    time in market—not a formal confidence interval.
+    """
+    spend_share = float(row.get("Spend Share", 0) or 0)
+    active_days = int(row.get("Active_Days", 0) or 0)
+
+    if funnel_stage == "Conversion":
+        volume = float(row.get("Total Conversions", 0) or 0)
+        if spend_share >= 5 and volume >= 50 and active_days >= 7:
+            return "Strong"
+        if spend_share >= 2 and volume >= 20 and active_days >= 3:
+            return "Moderate"
+        return "Weak"
+
+    if funnel_stage == "Awareness":
+        volume = float(row.get("Impressions", 0) or 0)
+        if spend_share >= 5 and volume >= 2_000_000 and active_days >= 7:
+            return "Strong"
+        if spend_share >= 2 and volume >= 500_000 and active_days >= 3:
+            return "Moderate"
+        return "Weak"
+
+    return "Weak"
+
+
+def _format_goal_check(metric_name, actual, goal, status):
+    if metric_name is None:
+        return "Not required"
+    actual_text = format_metric_value(metric_name, actual) if pd.notna(actual) else "N/A"
+    goal_text = format_metric_value(metric_name, goal) if goal is not None else "N/A"
+    return f"{metric_name}: {actual_text} vs goal {goal_text} ({status})"
+
+
+def apply_decision_support(result_df, analyzer_type):
+    """Apply TradeIQ's common evidence and guardrail framework to an analyzer."""
+    if result_df is None or result_df.empty:
+        return result_df
+
+    result = result_df.copy()
+
+    evidence_strengths = []
+    primary_checks = []
+    secondary_checks = []
+    roas_checks = []
+    guardrail_statuses = []
+    final_recommendations = []
+    signals = []
+    interpretations = []
+    actions = []
+    risks = []
+    rationales = []
+
+    positive_actions = {"SCALE", "PRIORITIZE", "PROMISING - GATHER MORE DATA"}
+    severe_negative_actions = {"NEGATION CANDIDATE", "PAUSE CANDIDATE", "AVOID / REDUCE"}
+    reduce_actions = {"REDUCE", "REFRESH / REDUCE"}
+
+    for _, row in result.iterrows():
+        evidence = compute_evidence_strength(row)
+
+        primary_actual = row.get(primary_kpi, np.nan)
+        primary_check = evaluate_kpi_guardrail(
+            primary_kpi, primary_actual, primary_kpi_goal
+        )
+
+        if secondary_kpi:
+            secondary_actual = row.get(secondary_kpi, np.nan)
+            secondary_check = evaluate_kpi_guardrail(
+                secondary_kpi, secondary_actual, secondary_kpi_goal
+            )
+        else:
+            secondary_actual = np.nan
+            secondary_check = "NOT REQUIRED"
+
+        roas_actual = row.get("ROAS", np.nan)
+        roas_check = evaluate_kpi_guardrail("ROAS", roas_actual, roas_goal)
+
+        required_checks = [primary_check, roas_check]
+        if secondary_kpi:
+            required_checks.append(secondary_check)
+
+        if "FAIL" in required_checks:
+            guardrail_status = "Failed"
+        elif "NOT AVAILABLE" in required_checks:
+            guardrail_status = "Incomplete"
+        elif "CONDITIONAL" in required_checks:
+            guardrail_status = "Conditional"
+        else:
+            guardrail_status = "Passed"
+
+        original_recommendation = str(row.get("Recommendation", "WATCH")).strip()
+        final_recommendation = original_recommendation
+
+        # Positive optimization requires evidence + KPI protection.
+        if original_recommendation in positive_actions:
+            if evidence == "Weak":
+                final_recommendation = "GATHER MORE DATA"
+            elif guardrail_status in {"Failed", "Incomplete"}:
+                final_recommendation = "DO NOT SCALE - GUARDRAIL FAILED"
+            elif evidence == "Moderate" or guardrail_status == "Conditional":
+                final_recommendation = "CONTROLLED TEST"
+            elif original_recommendation == "PROMISING - GATHER MORE DATA":
+                final_recommendation = "PRIORITIZE"
+
+        # High-risk negative actions also require strong evidence.
+        elif original_recommendation in severe_negative_actions:
+            if evidence == "Weak":
+                final_recommendation = "INVESTIGATE - MORE DATA NEEDED"
+            elif evidence == "Moderate":
+                final_recommendation = "REDUCE / INVESTIGATE"
+
+        elif original_recommendation in reduce_actions and evidence == "Weak":
+            final_recommendation = "INVESTIGATE - MORE DATA NEEDED"
+
+        # ---------------- Structured reason text ----------------
+        spend_share = row.get("Spend Share", np.nan)
+        warnings = int(row.get("Data_Quality_Warnings", 0) or 0)
+        active_days = int(row.get("Active_Days", 0) or 0)
+
+        if funnel_stage == "Conversion":
+            conv_share = row.get("Conversion Share", np.nan)
+            efficiency = row.get("Efficiency Index", np.nan)
+            cpa_value = row.get("CPA", np.nan)
+            roas_value = row.get("ROAS", np.nan)
+
+            signal = (
+                f"{format_percent(conv_share) if pd.notna(conv_share) else 'N/A'} of conversions "
+                f"from {format_percent(spend_share) if pd.notna(spend_share) else 'N/A'} of spend; "
+                f"CPA {format_currency(cpa_value) if pd.notna(cpa_value) else 'N/A'} and "
+                f"ROAS {format_multiplier(roas_value) if pd.notna(roas_value) else 'N/A'}."
+            )
+            interpretation = (
+                f"Efficiency Index {format_multiplier(efficiency) if pd.notna(efficiency) else 'N/A'}. "
+                f"Primary guardrail: {_format_goal_check(primary_kpi, primary_actual, primary_kpi_goal, primary_check)}. "
+                f"ROAS guardrail: {_format_goal_check('ROAS', roas_actual, roas_goal, roas_check)}."
+            )
+        else:
+            impression_share = row.get("Impression Share", np.nan)
+            completion_index = row.get("Completion Index", np.nan)
+            signal = (
+                f"{format_percent(impression_share) if pd.notna(impression_share) else 'N/A'} of impressions "
+                f"from {format_percent(spend_share) if pd.notna(spend_share) else 'N/A'} of spend; "
+                f"Completion Index {format_multiplier(completion_index) if pd.notna(completion_index) else 'N/A'}."
+            )
+            interpretation = (
+                f"Primary guardrail: {_format_goal_check(primary_kpi, primary_actual, primary_kpi_goal, primary_check)}. "
+                f"ROAS guardrail: {_format_goal_check('ROAS', roas_actual, roas_goal, roas_check)}."
+            )
+
+        if secondary_kpi:
+            interpretation += " " + _format_goal_check(
+                secondary_kpi, secondary_actual, secondary_kpi_goal, secondary_check
+            ) + "."
+
+        action_map = {
+            "SCALE": "Consider a measured increase in allocation while monitoring the configured KPI guardrails.",
+            "PRIORITIZE": "Prioritize this entity for incremental budget before weaker alternatives.",
+            "CONTROLLED TEST": "Use a small, controlled allocation change and re-evaluate after sufficient new data accumulates.",
+            "DO NOT SCALE - GUARDRAIL FAILED": "Do not add exposure yet. Diagnose the failed KPI guardrail before considering scale.",
+            "GATHER MORE DATA": "Hold the current setup and gather more observations before making a material optimization.",
+            "NEGATION CANDIDATE": "Validate business/context constraints, then consider exclusion or material reduction.",
+            "PAUSE CANDIDATE": "Validate the signal, then consider pausing or replacing the creative.",
+            "AVOID / REDUCE": "Reduce exposure after confirming the underperformance is not caused by a reporting anomaly.",
+            "REDUCE": "Reduce exposure in a controlled way and monitor whether the primary KPI improves.",
+            "REFRESH / REDUCE": "Reduce rotation and consider a creative refresh before a full pause.",
+            "REDUCE / INVESTIGATE": "Investigate the driver and use a partial reduction rather than an immediate hard stop.",
+            "INVESTIGATE - MORE DATA NEEDED": "Investigate the signal but avoid a high-impact change until evidence becomes stronger.",
+            "INVESTIGATE": "Diagnose the underlying driver before changing allocation.",
+            "MAINTAIN": "Maintain the current setup; no material optimization is supported by the evidence.",
+            "WATCH": "Continue monitoring. Current signals are mixed and do not justify a material change.",
+            "INSUFFICIENT DATA": "Gather more data before taking action."
+        }
+        action_text = action_map.get(
+            final_recommendation,
+            "Review the evidence and use trader judgment before changing the DSP."
+        )
+
+        risk_parts = [
+            f"Evidence Strength is {evidence} based on volume, spend share, and {active_days} active day(s)."
+        ]
+        if guardrail_status != "Passed":
+            risk_parts.append(f"Guardrail status is {guardrail_status}.")
+        if warnings > 0:
+            risk_parts.append(f"{warnings} source row warning(s) are present for this entity and should be reviewed.")
+        if final_recommendation in {"SCALE", "PRIORITIZE", "CONTROLLED TEST"}:
+            risk_parts.append("Performance may deteriorate as spend expands; re-check CPA/ROAS and the secondary KPI after the change.")
+        risk_text = " ".join(risk_parts)
+
+        rationale = (
+            f"SIGNAL: {signal} | INTERPRETATION: {interpretation} | "
+            f"ACTION: {action_text} | RISK: {risk_text}"
+        )
+
+        evidence_strengths.append(evidence)
+        primary_checks.append(primary_check)
+        secondary_checks.append(secondary_check)
+        roas_checks.append(roas_check)
+        guardrail_statuses.append(guardrail_status)
+        final_recommendations.append(final_recommendation)
+        signals.append(signal)
+        interpretations.append(interpretation)
+        actions.append(action_text)
+        risks.append(risk_text)
+        rationales.append(rationale)
+
+    result["Original Recommendation"] = result["Recommendation"]
+    result["Recommendation"] = final_recommendations
+    result["Evidence Strength"] = evidence_strengths
+    # Keep the existing column for backwards-compatible UI, but make the label
+    # truthful by using evidence strength rather than statistical confidence.
+    result["Confidence"] = evidence_strengths
+    result["Primary Guardrail"] = primary_checks
+    result["Secondary Guardrail"] = secondary_checks
+    result["ROAS Guardrail"] = roas_checks
+    result["Guardrail Status"] = guardrail_statuses
+    result["Signal"] = signals
+    result["Interpretation"] = interpretations
+    result["Action Guidance"] = actions
+    result["Risk"] = risks
+    result["Reason"] = rationales
+
+    return result
 
 
 def calculate_audience_recommendations(data):
@@ -2585,6 +2857,7 @@ def calculate_audience_recommendations(data):
             "Campaign funnel stage is not assigned."
         )
 
+    audience_df = apply_decision_support(audience_df, "audience")
     return audience_df
 
 
@@ -2793,7 +3066,7 @@ def render_audience_recommendation_engine():
         scorecard_columns = [
             "Audience_Segment",
             "Recommendation",
-            "Confidence",
+            "Evidence Strength",
             "Spend Share",
             "Conversion Share",
             "Revenue Share",
@@ -2810,7 +3083,7 @@ def render_audience_recommendation_engine():
         scorecard_columns = [
             "Audience_Segment",
             "Recommendation",
-            "Confidence",
+            "Evidence Strength",
             "Spend Share",
             "Impression Share",
             "Completion Rate",
@@ -3546,6 +3819,7 @@ def calculate_specialized_dimension_recommendations(
         result["Confidence"] = "Low"
         result["Reason"] = "Campaign funnel stage is not assigned."
 
+    result = apply_decision_support(result, analyzer_type)
     return result
 
 
@@ -3695,7 +3969,7 @@ def render_specialized_decision_analyzer(
             base_columns
             + [
                 "Recommendation",
-                "Confidence",
+                "Evidence Strength",
                 "Spend Share",
                 "Conversion Share",
                 "Revenue Share",
@@ -3720,7 +3994,7 @@ def render_specialized_decision_analyzer(
             base_columns
             + [
                 "Recommendation",
-                "Confidence",
+                "Evidence Strength",
                 "Spend Share",
                 "Impression Share",
                 "Completion Rate",
@@ -3739,7 +4013,7 @@ def render_specialized_decision_analyzer(
             base_columns
             + [
                 "Recommendation",
-                "Confidence",
+                "Evidence Strength",
                 "Spend Share",
                 "Impression Share",
                 "Completion Rate",
@@ -5480,6 +5754,163 @@ def render_clean_analyzer(label,dim,prefix):
 # ---------------------------------------------------
 
 
+# ---------------------------------------------------
+# PACING & DELIVERY: FLIGHT CALCULATION AND EVIDENCE
+# ---------------------------------------------------
+def calculate_flight_pacing(start, end, report_through, spend_to_date, total_budget):
+    start, end, report_through = [pd.Timestamp(x).normalize() for x in (start, end, report_through)]
+    if end < start or total_budget <= 0:
+        raise ValueError('End date must follow start date and budget must be positive.')
+    total_days = (end - start).days + 1
+    elapsed = max(0, min(total_days, (report_through - start).days + 1))
+    expected = elapsed / total_days * 100
+    actual = spend_to_date / total_budget * 100
+    gap = round(actual - expected, 10)
+    remaining_days = total_days - elapsed
+    remaining_budget = max(0, total_budget - spend_to_date)
+    status = 'Not Started' if elapsed == 0 else ('Underpacing' if gap < -5 else 'Overpacing' if gap > 5 else 'On Track')
+    return dict(total_days=total_days, elapsed=elapsed, expected=expected, actual=actual,
+                gap=gap, remaining_days=remaining_days, remaining_budget=remaining_budget,
+                required_daily=remaining_budget / remaining_days if remaining_days else None, status=status)
+
+
+def render_pacing_delivery_analyzer():
+    st.subheader('Pacing & Delivery Analyzer')
+    st.caption('Compare spend to elapsed flight time, then investigate the delivery pattern.')
+    source = campaign_df.copy()
+    source['Date'] = pd.to_datetime(source['Date'], errors='coerce').dt.normalize()
+    dates = source['Date'].dropna()
+    if dates.empty:
+        st.info('A valid mapped Date column is required for pacing analysis.')
+        return
+    # Report cutoff comes from all campaign rows, including reconciliation rows.
+    raw_dates = pd.to_datetime(raw_campaign_df['Date'], errors='coerce').dropna()
+    cutoff = raw_dates.max().normalize() if not raw_dates.empty else dates.max()
+    key = 'pacing_' + str(selected_campaign)
+    st.markdown('### Campaign Flight Setup')
+    c1, c2, c3 = st.columns(3)
+    start = c1.date_input('Campaign Start Date', dates.min().date(), key=key+'_start')
+    end = c2.date_input('Campaign End Date', dates.max().date(), key=key+'_end')
+    flight_budget = c3.number_input('Total Flight Budget ($)', min_value=0.0, value=float(max(0, budget)), key=key+'_budget', help='Confirm the full campaign budget. Repeated campaign budgets in line-item rows must not be summed.')
+    st.caption(f'Current report through: {cutoff:%b %d, %Y}. Dates are inclusive; expected spend follows an even daily schedule. Initial dates are report dates—set the planned flight dates.')
+    complete = st.checkbox('I confirm the report includes all spend from flight start through the report cutoff', key=key+'_complete')
+    if end < start or flight_budget <= 0:
+        st.info('Set a valid flight and a positive total budget to continue.')
+        return
+    first, last = pd.Timestamp(start), pd.Timestamp(end)
+    flight = source[source['Date'].between(first, min(last, cutoff))].copy()
+    flight_spend = float(flight['Spend_USD'].sum())
+    p = calculate_flight_pacing(start, end, cutoff, flight_spend, flight_budget)
+    if not complete:
+        st.warning('Provisional: spend coverage is unconfirmed. Delivery status and actions require complete flight-to-date spend.')
+    st.markdown('### Delivery Health')
+    title = f"{p['status']} — {p['gap']:+.1f}pp vs expected delivery"
+    if not complete:
+        title = 'Provisional • ' + title
+    (st.warning if p['status'] in ('Underpacing', 'Overpacing') else st.info)(title)
+    tiles = st.columns(4)
+    for col, label, value in zip(tiles, ['Flight Progress', 'Actual Spend', 'Expected Spend', 'Pacing Gap'], [f"{p['expected']:.1f}%", f"{p['actual']:.1f}%", f"{p['expected']:.1f}%", f"{p['gap']:+.1f}pp"]):
+        col.metric(label, value)
+    st.caption(f"Spend to date: ${flight_spend:,.2f} / ${flight_budget:,.2f} • {p['elapsed']} of {p['total_days']} flight days elapsed • ±5pp tolerance")
+    if cutoff < first:
+        st.info('The report predates the flight. No delivery assessment is available yet.')
+        return
+    if flight.empty:
+        st.warning('No valid media rows are available within this flight. Check dates and reconciliation before changing delivery.')
+        return
+    # Calendar windows include non-spending dates, avoiding active-day bias.
+    through = min(last, cutoff)
+    daily = flight.groupby('Date')[['Spend_USD', 'Impressions_Served']].sum().reindex(pd.date_range(first, through), fill_value=0)
+    recent = daily.tail(3)
+    previous = daily.iloc[max(0, len(daily)-10):max(0, len(daily)-3)]
+    observed_dates = set(flight['Date'].dropna())
+    missing_days = sum(day not in observed_dates for day in daily.index)
+    recent_avg = float(recent['Spend_USD'].mean())
+    evidence, findings, actions = [], [], []
+    evidence.append(f"Recent daily spend: ${recent_avg:,.2f} across {len(recent)} calendar days.")
+    required = p['required_daily']
+    if required is not None:
+        evidence.append(f"Required daily spend: ${required:,.2f} over {p['remaining_days']} remaining days; remaining budget ${p['remaining_budget']:,.2f}.")
+        if required > 0 and len(recent) == 3:
+            velocity = recent_avg / required
+            if velocity < .8:
+                findings.append(('Low recent spend velocity', f'Recent daily spend is {(1-velocity)*100:.1f}% below the rate needed to finish on budget. This measures the shortfall; it does not establish a bid or targeting cause.'))
+                actions.append('Review daily caps, bid competitiveness, eligible audience size, frequency limits, and deal availability in the DSP before increasing allocation.')
+            elif velocity > 1.2:
+                findings.append(('High recent spend velocity', f'Recent daily spend is {(velocity-1)*100:.1f}% above the remaining-budget daily rate.'))
+                actions.append('Review daily pacing controls and caps; align planned daily spend with the remaining flight budget.')
+    if len(previous) >= 3 and len(recent) == 3:
+        old_spend, new_spend = previous['Spend_USD'].mean(), recent['Spend_USD'].mean()
+        old_imp, new_imp = previous['Impressions_Served'].mean(), recent['Impressions_Served'].mean()
+        spend_change = new_spend / old_spend - 1 if old_spend > 0 else None
+        imp_change = new_imp / old_imp - 1 if old_imp > 0 else None
+        old_cpm = previous['Spend_USD'].sum() / previous['Impressions_Served'].sum() * 1000 if previous['Impressions_Served'].sum() > 0 else None
+        new_cpm = recent['Spend_USD'].sum() / recent['Impressions_Served'].sum() * 1000 if recent['Impressions_Served'].sum() > 0 else None
+        cpm_change = new_cpm / old_cpm - 1 if old_cpm and new_cpm is not None else None
+        if spend_change is not None:
+            evidence.append(f"Daily spend change: {spend_change:+.1%}; last 3 calendar days vs previous {len(previous)} calendar days.")
+        if imp_change is not None:
+            evidence.append(f'Daily impression change: {imp_change:+.1%}.')
+        if cpm_change is not None:
+            evidence.append(f'Weighted CPM: ${old_cpm:,.2f} → ${new_cpm:,.2f} ({cpm_change:+.1%}).')
+        if spend_change is not None and spend_change > .25:
+            findings.append(('Recent spend acceleration', 'Daily spend rose more than 25% against the preceding calendar window. Check DSP settings and change history to identify the trigger.'))
+        if imp_change is not None and imp_change < -.2 and cpm_change is not None and abs(cpm_change) <= .1:
+            findings.append(('Falling delivered scale', 'Daily impressions declined more than 20% while weighted CPM stayed within 10%. Limited eligible supply is a hypothesis; delivered impressions do not measure auction opportunity.'))
+        if cpm_change is not None and cpm_change > .2:
+            findings.append(('Rising media cost', 'Weighted CPM increased more than 20%. This explains fewer impressions per dollar, but alone does not explain an inability to spend.'))
+        if cpm_change is not None and cpm_change < -.2 and imp_change is not None and imp_change > .25:
+            findings.append(('Cheaper, higher-volume delivery', 'CPM fell more than 20% while daily impressions rose more than 25%. Review inventory mix before changing bids.'))
+    line_spend = flight.groupby('Line_Item_Name')['Spend_USD'].sum().sort_values(ascending=False)
+    if len(line_spend) >= 3 and flight_spend > 0:
+        top_share = float(line_spend.iloc[:2].sum() / flight_spend)
+        evidence.append(f'Top two reported line items account for {top_share:.1%} of flight-to-date spend across {len(line_spend)} reported line items.')
+        if top_share > .8:
+            findings.append(('Concentrated delivery', 'More than 80% of spend is in two reported line items. This may be intentional; confirm planned allocations and eligibility before redistributing.'))
+            actions.append('Inspect low-spending reported line items and their planned budgets; move budget only where KPI guardrails permit.')
+    if missing_days:
+        evidence.append(f'{missing_days} calendar dates have no valid media rows. These can represent no delivery or omitted report data; no-row dates are treated as zero only for the provisional trend.')
+    if reconciliation_spend > 0:
+        evidence.append(f'Campaign reconciliation includes ${reconciliation_spend:,.2f} excluded spend. This analyzer uses valid media spend; reconcile billed delivery separately.')
+    st.markdown('### Why Is This Happening?')
+    if not complete:
+        st.info('Cause assessment is provisional until spend coverage is confirmed.')
+    if findings:
+        for label, detail in findings[:2]:
+            st.markdown(f'**{label}**  \n{detail}')
+    else:
+        st.info('No clear driver is established by the available report. Review DSP settings and data coverage.' if p['status'] != 'On Track' else 'Delivery is within tolerance. Available evidence does not establish a near-term delivery risk.')
+    if p['remaining_days'] == 0:
+        st.caption('Flight completed: this is a final delivery assessment. There are no remaining days to recover or slow delivery.')
+    elif complete and len(recent) == 3:
+        forecast = flight_spend + recent_avg * p['remaining_days']
+        st.caption(f'At the last 3 calendar days’ spend rate, projected final delivery is {forecast / flight_budget:.1%}. This is a constant-rate scenario, not a guaranteed forecast.')
+    st.markdown('### Recommended Action')
+    if not complete:
+        st.write('Confirm the full flight-to-date export and total budget before taking a pacing action.')
+    elif p['remaining_days'] == 0:
+        st.write('Reconcile final delivery against the flight budget and document the gap for the next flight.')
+    else:
+        if not actions:
+            actions = ['Maintain current delivery controls and monitor daily spend against the remaining-budget rate.' if p['status'] == 'On Track' else 'Verify report coverage and review DSP daily budgets, bids, targeting, and supply availability. Cause is not confirmed.']
+        for i, action in enumerate(actions[:2], 1):
+            st.write(f'{i}. {action}')
+        st.caption('Recheck after 1–3 complete reporting days. Protect configured performance goals when adjusting delivery.')
+    with st.expander('View Supporting Evidence', expanded=False):
+        st.caption('Diagnostic thresholds are initial heuristics, not statistically confirmed anomalies or causal proof.')
+        for item in evidence:
+            st.write('• ' + item)
+        st.caption('Trend comparison requires 3 recent and at least 3 prior calendar days. Missing rows are not proof of inactivity; line items absent from the report cannot be diagnosed.')
+        trend = daily.copy()
+        trend['Actual Cumulative Spend'] = trend['Spend_USD'].cumsum()
+        trend['Expected Cumulative Spend'] = np.arange(1, len(trend)+1) / p['total_days'] * flight_budget
+        st.line_chart(trend[['Actual Cumulative Spend', 'Expected Cumulative Spend']])
+        st.dataframe(daily.reset_index().rename(columns={'index':'Date'}), hide_index=True, use_container_width=True)
+# ---------------------------------------------------
+# END PACING & DELIVERY ANALYZER
+# ---------------------------------------------------
+
+
 if page == "Campaign Overview": 
     tiq_health()
 
@@ -6487,116 +6918,597 @@ elif page == "Monthly Trends":
 # ---------------------------------------------------
 # SECTION 23: OPTIMIZATION ACTION CENTER
 # ---------------------------------------------------
-# Consolidates decision recommendations from Audience,
-# Creative, Inventory, and Domain / Website analyzers.
+# TradeIQ turns analyzer output into a clutter-free decision workflow:
 #
-# The Action Center does not create a new optimization
-# model. It uses the same recommendation engines that
-# power each analyzer so the recommendations remain
-# consistent across the application.
+#   1. QUICK TRIAGE
+#      A compact queue shows only the information needed to choose what to review.
+#
+#   2. DECISION BRIEF
+#      Signal -> Root Cause -> Action -> Priority -> Risk
+#
+#   3. SUPPORTING EVIDENCE
+#      Detailed metrics and guardrails stay behind tabs/expanders so the main
+#      decision screen remains easy to scan.
+#
+#   4. TRADER DECISION
+#      The trader can record Accept / Modify / Reject without leaving the page.
+#
+# The Action Center intentionally remains a decision-support system.
+# It explains and documents the recommendation; it does not execute DSP changes.
 
 elif page == "Optimization Action Center":
-    tiq_action_queue()
 
+    import html as _html
+    from pathlib import Path as _Path
 
+    # ---------------------------------------------------
+    # ACTION CENTER VISUAL SYSTEM
+    # ---------------------------------------------------
     st.markdown(
-        '<div class="section-label">Optimization Action Center</div>',
+        """
+        <style>
+        .tiq-action-header {
+            margin-bottom: 0.25rem;
+        }
+
+        .tiq-action-subtitle {
+            color: #9ca3af;
+            margin-bottom: 1.0rem;
+            line-height: 1.45;
+        }
+
+        .tiq-decision-hero {
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 16px;
+            padding: 1.05rem 1.15rem;
+            background: rgba(255,255,255,0.025);
+            margin: 0.35rem 0 0.9rem 0;
+        }
+
+        .tiq-decision-kicker {
+            color: #9ca3af;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.25rem;
+        }
+
+        .tiq-decision-title {
+            font-size: clamp(1.25rem, 1.7vw, 1.75rem);
+            font-weight: 760;
+            line-height: 1.15;
+            margin-bottom: 0.35rem;
+        }
+
+        .tiq-decision-meta {
+            color: #aeb6c2;
+            font-size: 0.88rem;
+            line-height: 1.4;
+        }
+
+        .tiq-brief-card {
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 14px;
+            padding: 0.95rem 1.05rem;
+            background: rgba(255,255,255,0.018);
+            margin-bottom: 0.7rem;
+        }
+
+        .tiq-brief-label {
+            color: #9ca3af;
+            font-size: 0.76rem;
+            font-weight: 750;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            margin-bottom: 0.42rem;
+        }
+
+        .tiq-brief-text {
+            font-size: 0.96rem;
+            line-height: 1.55;
+            margin: 0;
+        }
+
+        .tiq-action-step {
+            margin-bottom: 0.45rem;
+            line-height: 1.5;
+        }
+
+        .tiq-action-step:last-child {
+            margin-bottom: 0;
+        }
+
+        .tiq-priority-high {
+            color: #ff6b6b;
+            font-weight: 750;
+        }
+
+        .tiq-priority-medium {
+            color: #f0b95a;
+            font-weight: 750;
+        }
+
+        .tiq-priority-low {
+            color: #9ca3af;
+            font-weight: 750;
+        }
+
+        .tiq-why-box {
+            border-left: 4px solid rgba(255,255,255,0.35);
+            padding: 0.8rem 1rem;
+            background: rgba(255,255,255,0.025);
+            border-radius: 0 10px 10px 0;
+            margin: 0.85rem 0 0.35rem 0;
+            line-height: 1.5;
+        }
+
+        .tiq-mini-note {
+            color: #8f98a5;
+            font-size: 0.80rem;
+            line-height: 1.4;
+        }
+
+        /* Keep Action Center dataframes visually compact. */
+        div[data-testid="stDataFrame"] {
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        </style>
+        """,
         unsafe_allow_html=True
     )
 
-    st.caption(
-        "A single decision queue combining recommendations from Audience, "
-        "Creative, Inventory, and Domain / Website analysis. Evidence uses "
-        "only the metrics and indices that drive the recommendation for the "
-        "campaign funnel stage."
+    st.markdown(
+        '<div class="section-label tiq-action-header">Optimization Action Center</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        """
+        <div class="tiq-action-subtitle">
+            Review the highest-impact decisions first. Open one recommendation to see the
+            signal, evidence-based interpretation, exact action steps, urgency, and risk.
+            Supporting metrics stay tucked away until you need them.
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    def action_priority(recommendation):
-        """Convert analyzer recommendations into a simple action priority."""
+    # ---------------------------------------------------
+    # HELPER FUNCTIONS
+    # ---------------------------------------------------
+    def _finite_number(value, default=np.nan):
+        try:
+            value = float(value)
+            return value if np.isfinite(value) else default
+        except (TypeError, ValueError):
+            return default
 
-        recommendation = str(recommendation).upper().strip()
 
-        p1_actions = {
-            "SCALE",
+    def _safe_pct(value):
+        value = _finite_number(value)
+        return format_percent(value) if pd.notna(value) else "N/A"
+
+
+    def _safe_money(value):
+        value = _finite_number(value)
+        return format_currency(value) if pd.notna(value) else "N/A"
+
+
+    def _safe_multiplier(value):
+        value = _finite_number(value)
+        return format_multiplier(value) if pd.notna(value) else "N/A"
+
+
+    def _html_text(value):
+        return _html.escape(str(value if value is not None else "N/A"))
+
+
+    def _priority_from_row(row):
+        """
+        Priority is intentionally row-aware rather than recommendation-only.
+
+        High:
+        - Strong evidence + meaningful spend exposure + a protective action
+          (failed guardrail, negation/pause/avoid candidate).
+
+        Medium:
+        - Controlled scale/reduction/investigation with enough evidence to act.
+
+        Low:
+        - Weak evidence, maintain/watch, or gather-more-data situations.
+        """
+        recommendation = str(row.get("Recommendation", "")).upper().strip()
+        evidence = str(row.get("Evidence Strength", "Weak")).title()
+        spend_share = _finite_number(row.get("Spend Share", 0), 0)
+
+        protective_actions = {
+            "DO NOT SCALE - GUARDRAIL FAILED",
             "NEGATION CANDIDATE",
             "PAUSE CANDIDATE",
             "AVOID / REDUCE"
         }
 
-        p2_actions = {
+        medium_actions = {
+            "SCALE",
             "PRIORITIZE",
+            "CONTROLLED TEST",
             "REDUCE",
+            "REDUCE / INVESTIGATE",
             "REFRESH / REDUCE",
             "INVESTIGATE"
         }
 
-        if recommendation in p1_actions:
-            return "P1 - Act Now"
+        if (
+            recommendation in protective_actions
+            and evidence == "Strong"
+            and spend_share >= 5
+        ):
+            return "P1 - Protect Performance"
 
-        if recommendation in p2_actions:
-            return "P2 - Optimize"
+        if recommendation in medium_actions and evidence in {"Strong", "Moderate"}:
+            return "P2 - Optimize Soon"
 
-        return "P3 - Monitor"
+        if (
+            recommendation == "DO NOT SCALE - GUARDRAIL FAILED"
+            and evidence in {"Strong", "Moderate"}
+        ):
+            return "P2 - Optimize Soon"
 
-
-    def format_index(value):
-        """Safely format an index for evidence text."""
-
-        if pd.isna(value) or not np.isfinite(value):
-            return "N/A"
-
-        return format_multiplier(value)
+        return "P3 - Monitor / Gather Evidence"
 
 
-    def build_action_evidence(row, analyzer_type):
+    def _priority_guidance(priority):
+        if priority == "P1 - Protect Performance":
+            return (
+                "High — review today",
+                "tiq-priority-high"
+            )
+        if priority == "P2 - Optimize Soon":
+            return (
+                "Medium — act within 2–3 days",
+                "tiq-priority-medium"
+            )
+        return (
+            "Low — monitor or gather more evidence",
+            "tiq-priority-low"
+        )
+
+
+    def _build_root_cause(row, analyzer_type):
         """
-        Build evidence using only decision-driving signals.
-        Diagnostic / vanity metrics are intentionally excluded.
+        Explain the observable relationship without overstating causality.
+        We deliberately use 'indicates' / 'suggests' instead of claiming that
+        the report proves a behavioral cause.
         """
+        recommendation = str(row.get("Recommendation", "")).upper().strip()
+        evidence = str(row.get("Evidence Strength", "Weak")).title()
 
-        confidence = row.get("Confidence", "Low")
-        spend_value = row.get("Spend", 0)
-        spend_share = row.get("Spend Share", np.nan)
+        if funnel_stage == "Conversion":
+            efficiency = _finite_number(row.get("Efficiency Index", np.nan))
+            cpa_value = _finite_number(row.get("CPA", np.nan))
+            roas_value = _finite_number(row.get("ROAS", np.nan))
 
+            if pd.notna(efficiency):
+                if efficiency >= 1.10:
+                    relationship = (
+                        f"Efficiency Index {_safe_multiplier(efficiency)} means this entity's "
+                        f"conversion share is {efficiency:.2f}x its spend share. "
+                        "The available evidence therefore indicates above-average conversion efficiency."
+                    )
+                elif efficiency <= 0.90:
+                    relationship = (
+                        f"Efficiency Index {_safe_multiplier(efficiency)} means conversion contribution "
+                        "is not keeping pace with spend allocation. The available evidence indicates "
+                        "below-average conversion efficiency."
+                    )
+                else:
+                    relationship = (
+                        f"Efficiency Index {_safe_multiplier(efficiency)} is close to the campaign "
+                        "average of 1.00x, so the efficiency signal is not materially differentiated."
+                    )
+            else:
+                relationship = (
+                    "The report does not contain enough usable efficiency data to establish a "
+                    "strong conversion-efficiency relationship."
+                )
+
+            kpi_context = []
+            if pd.notna(cpa_value):
+                kpi_context.append(
+                    f"CPA is {_safe_money(cpa_value)} versus the "
+                    f"{_safe_money(primary_kpi_goal) if primary_kpi == 'CPA' else str(primary_kpi) + ' goal'}"
+                )
+            if pd.notna(roas_value):
+                kpi_context.append(
+                    f"ROAS is {_safe_multiplier(roas_value)} versus the "
+                    f"{_safe_multiplier(roas_goal)} goal"
+                )
+
+            return (
+                relationship
+                + (" " + "; ".join(kpi_context) + "." if kpi_context else "")
+                + f" Evidence Strength is {evidence}."
+            )
+
+        completion_index = _finite_number(row.get("Completion Index", np.nan))
+        viewability_index = _finite_number(row.get("Viewability Index", np.nan))
+        cpm_efficiency = _finite_number(row.get("CPM Efficiency", np.nan))
+
+        parts = []
+        if pd.notna(completion_index):
+            parts.append(
+                f"Completion Index {_safe_multiplier(completion_index)} compares completion "
+                "performance with the campaign average"
+            )
+        if analyzer_type in {"inventory", "domain"}:
+            if pd.notna(viewability_index):
+                parts.append(
+                    f"Viewability Index {_safe_multiplier(viewability_index)} describes relative "
+                    "supply quality"
+                )
+            if pd.notna(cpm_efficiency):
+                parts.append(
+                    f"CPM Efficiency {_safe_multiplier(cpm_efficiency)} describes relative supply cost"
+                )
+
+        if not parts:
+            return (
+                f"The available awareness data does not support a strong root-cause interpretation. "
+                f"Evidence Strength is {evidence}."
+            )
+
+        return (
+            ". ".join(parts)
+            + f". These signals describe the observed delivery relationship; they do not prove "
+              f"causality. Evidence Strength is {evidence}."
+        )
+
+
+    def _build_action_steps(row):
+        """
+        Create concrete but controlled execution guidance.
+
+        Dollar ranges scale with the entity's existing spend so the recommendation
+        remains useful for both small and large campaigns.
+        """
+        recommendation = str(row.get("Recommendation", "")).upper().strip()
+        current_spend = max(_finite_number(row.get("Spend", 0), 0), 0)
+        evidence = str(row.get("Evidence Strength", "Weak")).title()
+
+        increase_low = current_spend * 0.05
+        increase_high = current_spend * 0.10
+        next_low = current_spend * 0.10
+        next_high = current_spend * 0.20
+
+        monitor_window = "3–5 days" if evidence == "Strong" else "5–7 days"
+
+        primary_condition = ""
+        if primary_kpi and primary_kpi_goal is not None:
+            comparator = "<=" if primary_kpi in LOWER_IS_BETTER_KPIS else ">="
+            primary_condition = (
+                f"{primary_kpi} stays {comparator} "
+                f"{format_metric_value(primary_kpi, primary_kpi_goal)}"
+            )
+
+        guardrail_conditions = []
+        if primary_condition:
+            guardrail_conditions.append(primary_condition)
+        if roas_goal is not None:
+            guardrail_conditions.append(
+                f"ROAS stays >= {_safe_multiplier(roas_goal)}"
+            )
+        if secondary_kpi and secondary_kpi_goal is not None:
+            comparator = "<=" if secondary_kpi in LOWER_IS_BETTER_KPIS else ">="
+            guardrail_conditions.append(
+                f"{secondary_kpi} stays {comparator} "
+                f"{format_metric_value(secondary_kpi, secondary_kpi_goal)}"
+            )
+
+        condition_text = " and ".join(guardrail_conditions)
+
+        positive_actions = {"SCALE", "PRIORITIZE", "CONTROLLED TEST"}
+        negative_actions = {
+            "NEGATION CANDIDATE", "PAUSE CANDIDATE", "AVOID / REDUCE",
+            "REDUCE", "REDUCE / INVESTIGATE", "REFRESH / REDUCE"
+        }
+
+        if recommendation in positive_actions:
+            return [
+                (
+                    f"Shift approximately {_safe_money(increase_low)}–{_safe_money(increase_high)} "
+                    f"(5–10% of this entity's current spend) from lower-efficiency alternatives "
+                    "where business and delivery constraints allow."
+                ),
+                (
+                    f"Monitor the primary KPI, ROAS, secondary KPI, and conversion volume for "
+                    f"{monitor_window}."
+                ),
+                (
+                    f"If {condition_text}, consider another controlled increase of approximately "
+                    f"{_safe_money(next_low)}–{_safe_money(next_high)} (10–20% of current spend)."
+                    if condition_text
+                    else
+                    "If performance remains stable after the monitoring window, consider another "
+                    "controlled increase rather than a large one-time reallocation."
+                )
+            ]
+
+        if recommendation == "DO NOT SCALE - GUARDRAIL FAILED":
+            return [
+                "Hold additional budget on this entity; do not scale while a configured guardrail is failing.",
+                "Use the analyzer diagnostics to identify which KPI is breaking and whether the issue is persistent or a short-term fluctuation.",
+                (
+                    f"Reconsider scale only after {condition_text} for a sustained observation window."
+                    if condition_text
+                    else
+                    "Reconsider scale only after the failed guardrail has recovered and the signal remains supported."
+                )
+            ]
+
+        if recommendation in negative_actions:
+            reduction_low = current_spend * 0.15
+            reduction_high = current_spend * 0.25
+            return [
+                "Validate that the signal is not caused by a reporting anomaly, short-lived delivery issue, or obvious interaction effect.",
+                (
+                    f"Start with a controlled reduction of approximately "
+                    f"{_safe_money(reduction_low)}–{_safe_money(reduction_high)} "
+                    f"(15–25% of this entity's current spend) rather than an immediate full stop."
+                ),
+                (
+                    f"Monitor for {monitor_window}. If the campaign-level KPI improves while this "
+                    "entity remains weak, consider a stronger reduction, pause, or negation."
+                )
+            ]
+
+        if recommendation in {
+            "GATHER MORE DATA", "INVESTIGATE - MORE DATA NEEDED", "INSUFFICIENT DATA"
+        }:
+            return [
+                "Keep the current setup materially unchanged while more evidence accumulates.",
+                "Review data quality and the relevant diagnostic metrics for obvious measurement or delivery issues.",
+                "Re-evaluate once Evidence Strength improves or the KPI signal becomes materially stronger."
+            ]
+
+        if recommendation == "INVESTIGATE":
+            return [
+                "Open the relevant analyzer and identify which diagnostic metric is driving the weak signal.",
+                "Check whether the issue is isolated to this entity or appears across related audience, creative, inventory, or domain dimensions.",
+                "Make a controlled change only after the likely driver is identified."
+            ]
+
+        return [
+            "Maintain the current setup.",
+            "Continue monitoring the configured KPI guardrails.",
+            "Revisit only if performance meaningfully changes or new evidence emerges."
+        ]
+
+
+    def _build_risk_text(row):
+        recommendation = str(row.get("Recommendation", "")).upper().strip()
+        evidence = str(row.get("Evidence Strength", "Weak")).title()
+        efficiency = _finite_number(row.get("Efficiency Index", np.nan))
+        warnings = int(_finite_number(row.get("Data_Quality_Warnings", 0), 0) or 0)
+
+        positive_actions = {"SCALE", "PRIORITIZE", "CONTROLLED TEST"}
+
+        if recommendation in positive_actions and pd.notna(efficiency):
+            stressed_efficiency = efficiency * 0.85
+            relative_to_average = (stressed_efficiency - 1.0) * 100
+
+            if stressed_efficiency >= 1:
+                comparison = (
+                    f"Even then, the efficiency signal would remain approximately "
+                    f"{relative_to_average:.0f}% above the 1.00x campaign average."
+                )
+            else:
+                comparison = (
+                    f"That would put the efficiency signal approximately "
+                    f"{abs(relative_to_average):.0f}% below the 1.00x campaign average."
+                )
+
+            text = (
+                f"If efficiency deteriorates by 15% after the allocation change, the Efficiency "
+                f"Index would move from {_safe_multiplier(efficiency)} to "
+                f"{_safe_multiplier(stressed_efficiency)}. {comparison} "
+                "Scaling can change auction dynamics, available inventory, and marginal performance, "
+                "so the current relationship should be revalidated after the change."
+            )
+        elif recommendation in {
+            "NEGATION CANDIDATE", "PAUSE CANDIDATE", "AVOID / REDUCE",
+            "REDUCE", "REDUCE / INVESTIGATE", "REFRESH / REDUCE"
+        }:
+            text = (
+                "Reducing exposure too aggressively can remove incremental value if the observed "
+                "underperformance is temporary, caused by another dimension, or affected by attribution "
+                "noise. Use a controlled reduction and confirm campaign-level improvement before a hard stop."
+            )
+        elif evidence == "Weak":
+            text = (
+                "Evidence Strength is Weak. The observed result may be normal variance rather than a "
+                "stable performance relationship, so a large optimization would be difficult to defend."
+            )
+        else:
+            text = (
+                "The current signal is not strong enough to justify a large change. Continue monitoring "
+                "for a material shift in performance or guardrail status."
+            )
+
+        if warnings > 0:
+            text += (
+                f" There are also {warnings} data-quality warning(s) associated with this entity; "
+                "review them before execution."
+            )
+
+        return text
+
+
+    def _build_signal_text(row):
+        if funnel_stage == "Conversion":
+            conv_share = _finite_number(row.get("Conversion Share", np.nan))
+            spend_share = _finite_number(row.get("Spend Share", np.nan))
+            return (
+                f"This {str(row.get('Analyzer', 'entity')).lower()} generates "
+                f"{_safe_pct(conv_share)} of campaign conversions from "
+                f"{_safe_pct(spend_share)} of campaign spend."
+            )
+
+        impression_share = _finite_number(row.get("Impression Share", np.nan))
+        spend_share = _finite_number(row.get("Spend Share", np.nan))
+        return (
+            f"This {str(row.get('Analyzer', 'entity')).lower()} delivers "
+            f"{_safe_pct(impression_share)} of campaign impressions from "
+            f"{_safe_pct(spend_share)} of campaign spend."
+        )
+
+
+    def _build_why_it_matters(row):
+        recommendation = str(row.get("Recommendation", "")).upper().strip()
+        if recommendation in {"SCALE", "PRIORITIZE", "CONTROLLED TEST"}:
+            return (
+                "The trader can see the opportunity, the exact guardrails that must stay intact, "
+                "and a controlled way to test additional allocation instead of making an all-or-nothing move."
+            )
+        if recommendation in {
+            "DO NOT SCALE - GUARDRAIL FAILED",
+            "NEGATION CANDIDATE", "PAUSE CANDIDATE", "AVOID / REDUCE",
+            "REDUCE", "REDUCE / INVESTIGATE", "REFRESH / REDUCE"
+        }:
+            return (
+                "The trader can explain why exposure should be protected or reduced, while showing "
+                "that the decision was based on evidence rather than a single bad metric."
+            )
+        return (
+            "The trader can document why no major action was taken yet and show that the decision "
+            "was based on evidence strength and KPI guardrails."
+        )
+
+
+    def _build_action_evidence(row, analyzer_type):
+        """Compact evidence string used only inside the queue."""
         evidence_parts = []
 
         if funnel_stage == "Conversion":
-
-            evidence_parts.extend(
-                [
-                    f"Efficiency Index {format_index(row.get('Efficiency Index', np.nan))}",
-                    f"CPA Index {format_index(row.get('CPA Index', np.nan))}",
-                    f"ROAS Index {format_index(row.get('ROAS Index', np.nan))}"
-                ]
-            )
-
-        elif funnel_stage == "Awareness":
-
             evidence_parts.append(
-                f"Completion Index {format_index(row.get('Completion Index', np.nan))}"
+                f"Eff {_safe_multiplier(row.get('Efficiency Index', np.nan))}"
             )
-
-            # Viewability and CPM are supply-quality decision signals for
-            # Inventory and Domain only. They are not used for Creative or
-            # Audience recommendations unless the underlying engine uses them.
+            evidence_parts.append(
+                f"CPA {_safe_money(row.get('CPA', np.nan))}"
+            )
+            evidence_parts.append(
+                f"ROAS {_safe_multiplier(row.get('ROAS', np.nan))}"
+            )
+        else:
+            evidence_parts.append(
+                f"Completion {_safe_multiplier(row.get('Completion Index', np.nan))}"
+            )
             if analyzer_type in {"inventory", "domain"}:
-                evidence_parts.extend(
-                    [
-                        f"Viewability Index {format_index(row.get('Viewability Index', np.nan))}",
-                        f"CPM Efficiency {format_index(row.get('CPM Efficiency', np.nan))}"
-                    ]
-                )
-
-            elif analyzer_type == "audience":
                 evidence_parts.append(
-                    f"CPM Efficiency {format_index(row.get('CPM Efficiency', np.nan))}"
+                    f"Viewability {_safe_multiplier(row.get('Viewability Index', np.nan))}"
                 )
-
-        if pd.notna(spend_share):
-            evidence_parts.append(f"Spend Share {format_percent(spend_share)}")
-
-        evidence_parts.append(f"Spend {format_currency(spend_value)}")
-        evidence_parts.append(f"{confidence} Confidence")
+                evidence_parts.append(
+                    f"CPM Eff {_safe_multiplier(row.get('CPM Efficiency', np.nan))}"
+                )
 
         return " • ".join(evidence_parts)
 
@@ -6608,30 +7520,31 @@ elif page == "Optimization Action Center":
         item_column,
         analyzer_type
     ):
-        """Convert one analyzer result into Action Center rows."""
-
+        """Convert one analyzer result into one consistent decision table."""
         if result_df is None or result_df.empty:
             return
 
-        required_columns = {
-            item_column,
-            "Recommendation",
-            "Reason"
-        }
-
+        required_columns = {item_column, "Recommendation"}
         if not required_columns.issubset(result_df.columns):
             return
 
         action_df = result_df.copy()
-
-        action_df["Priority"] = action_df["Recommendation"].apply(
-            action_priority
-        )
-
         action_df["Analyzer"] = analyzer_name
+        action_df["Analyzer Type"] = analyzer_type
         action_df["Item"] = action_df[item_column].astype(str)
-        action_df["Evidence"] = action_df.apply(
-            lambda row: build_action_evidence(row, analyzer_type),
+
+        # Build the Action Center's trader-facing narrative.
+        action_df["Priority"] = action_df.apply(_priority_from_row, axis=1)
+        action_df["Signal"] = action_df.apply(_build_signal_text, axis=1)
+        action_df["Root Cause"] = action_df.apply(
+            lambda row: _build_root_cause(row, analyzer_type),
+            axis=1
+        )
+        action_df["Action Steps"] = action_df.apply(_build_action_steps, axis=1)
+        action_df["Risk Scenario"] = action_df.apply(_build_risk_text, axis=1)
+        action_df["Why It Matters"] = action_df.apply(_build_why_it_matters, axis=1)
+        action_df["Evidence Summary"] = action_df.apply(
+            lambda row: _build_action_evidence(row, analyzer_type),
             axis=1
         )
 
@@ -6640,28 +7553,39 @@ elif page == "Optimization Action Center":
             pd.Series(0, index=action_df.index)
         )
 
-        frames.append(
-            action_df[
-                [
-                    "Priority",
-                    "Analyzer",
-                    "Item",
-                    "Recommendation",
-                    "Evidence",
-                    "Reason",
-                    "_Spend"
-                ]
-            ]
-        )
+        # Make every downstream column safe even when an analyzer does not use it.
+        decision_columns = [
+            "Priority", "Analyzer", "Analyzer Type", "Item", "Recommendation",
+            "Evidence Strength", "Guardrail Status",
+            "Primary Guardrail", "Secondary Guardrail", "ROAS Guardrail",
+            "Signal", "Root Cause", "Action Steps", "Risk Scenario",
+            "Why It Matters", "Evidence Summary", "_Spend",
+            "Spend Share", "Conversion Share", "Impression Share",
+            "Efficiency Index", "CPA", "ROAS", "Total Conversions",
+            "Completion Rate", "Completion Index", "Viewability",
+            "Viewability Index", "CPM", "CPM Efficiency",
+            "Active_Days", "Data_Quality_Warnings"
+        ]
+
+        for column in decision_columns:
+            if column not in action_df.columns:
+                action_df[column] = np.nan if column not in {
+                    "Priority", "Analyzer", "Analyzer Type", "Item",
+                    "Recommendation", "Evidence Strength", "Guardrail Status",
+                    "Primary Guardrail", "Secondary Guardrail", "ROAS Guardrail",
+                    "Signal", "Root Cause", "Risk Scenario",
+                    "Why It Matters", "Evidence Summary"
+                } else ""
+
+        frames.append(action_df[decision_columns])
 
 
+    # ---------------------------------------------------
+    # BUILD ONE DECISION QUEUE FROM ALL ANALYZERS
+    # ---------------------------------------------------
     action_frames = []
 
-    # ---------------- Audience ----------------
-    audience_actions = calculate_audience_recommendations(
-        campaign_df
-    )
-
+    audience_actions = calculate_audience_recommendations(campaign_df)
     append_actions(
         action_frames,
         audience_actions,
@@ -6670,16 +7594,13 @@ elif page == "Optimization Action Center":
         "audience"
     )
 
-    # ---------------- Creative ----------------
     if "Creative_Name" in campaign_df.columns:
-
         creative_actions = calculate_specialized_dimension_recommendations(
             campaign_df,
             "Creative_Name",
             "creative",
             metadata_columns=["Creative_Length_Sec"]
         )
-
         append_actions(
             action_frames,
             creative_actions,
@@ -6688,7 +7609,6 @@ elif page == "Optimization Action Center":
             "creative"
         )
 
-    # ---------------- Inventory ----------------
     inventory_dimensions = {
         "Inventory - Channel": "Channel",
         "Inventory - Deal Type": "Deal_Type",
@@ -6696,7 +7616,6 @@ elif page == "Optimization Action Center":
     }
 
     for analyzer_name, dimension_column in inventory_dimensions.items():
-
         if dimension_column not in campaign_df.columns:
             continue
 
@@ -6705,7 +7624,6 @@ elif page == "Optimization Action Center":
             dimension_column,
             "inventory"
         )
-
         append_actions(
             action_frames,
             inventory_actions,
@@ -6714,15 +7632,9 @@ elif page == "Optimization Action Center":
             "inventory"
         )
 
-    # ---------------- Domain / Website ----------------
     possible_action_domain_columns = [
-        "Domain",
-        "Site",
-        "Website",
-        "Domain_Name",
-        "Site_Domain"
+        "Domain", "Site", "Website", "Domain_Name", "Site_Domain"
     ]
-
     action_domain_column = next(
         (
             column
@@ -6731,18 +7643,15 @@ elif page == "Optimization Action Center":
         ),
         None
     )
-
     if action_domain_column is None and "Publisher" in campaign_df.columns:
         action_domain_column = "Publisher"
 
     if action_domain_column is not None:
-
         domain_actions = calculate_specialized_dimension_recommendations(
             campaign_df,
             action_domain_column,
             "domain"
         )
-
         append_actions(
             action_frames,
             domain_actions,
@@ -6752,22 +7661,15 @@ elif page == "Optimization Action Center":
         )
 
     if not action_frames:
-
-        st.warning(
-            "No analyzer recommendations are available for this campaign."
-        )
+        st.warning("No analyzer recommendations are available for this campaign.")
 
     else:
-
-        action_center_df = pd.concat(
-            action_frames,
-            ignore_index=True
-        )
+        action_center_df = pd.concat(action_frames, ignore_index=True)
 
         priority_order = {
-            "P1 - Act Now": 1,
-            "P2 - Optimize": 2,
-            "P3 - Monitor": 3
+            "P1 - Protect Performance": 1,
+            "P2 - Optimize Soon": 2,
+            "P3 - Monitor / Gather Evidence": 3
         }
 
         action_center_df["_Priority_Order"] = (
@@ -6785,32 +7687,35 @@ elif page == "Optimization Action Center":
             .reset_index(drop=True)
         )
 
+        # ---------------------------------------------------
+        # QUICK TRIAGE SUMMARY
+        # ---------------------------------------------------
         p1_count = int(
-            (action_center_df["Priority"] == "P1 - Act Now").sum()
+            (action_center_df["Priority"] == "P1 - Protect Performance").sum()
         )
         p2_count = int(
-            (action_center_df["Priority"] == "P2 - Optimize").sum()
+            (action_center_df["Priority"] == "P2 - Optimize Soon").sum()
         )
         p3_count = int(
-            (action_center_df["Priority"] == "P3 - Monitor").sum()
+            (action_center_df["Priority"] == "P3 - Monitor / Gather Evidence").sum()
         )
 
         render_tile_grid(
             [
                 {
-                    "label": "P1 - Act Now",
+                    "label": "Protect Performance",
                     "value": f"{p1_count}",
-                    "note": "Highest-priority actions"
+                    "note": "Highest-risk items"
                 },
                 {
-                    "label": "P2 - Optimize",
+                    "label": "Optimize Soon",
                     "value": f"{p2_count}",
-                    "note": "Controlled optimizations"
+                    "note": "Controlled decisions"
                 },
                 {
-                    "label": "P3 - Monitor",
+                    "label": "Monitor",
                     "value": f"{p3_count}",
-                    "note": "Watch or gather more data"
+                    "note": "Weak / neutral signals"
                 },
                 {
                     "label": "Total Decisions",
@@ -6821,75 +7726,596 @@ elif page == "Optimization Action Center":
             compact=True
         )
 
-        st.markdown("### Optimization Queue")
+        st.write("")
 
-        priority_filter = st.selectbox(
-            "Priority Filter",
-            [
-                "All Priorities",
-                "P1 - Act Now",
-                "P2 - Optimize",
-                "P3 - Monitor"
-            ],
-            key="action_center_priority_filter"
-        )
+        # ---------------------------------------------------
+        # CLUTTER-FREE QUEUE CONTROLS
+        # ---------------------------------------------------
+        control_col1, control_col2 = st.columns([1.15, 1], gap="medium")
 
-        if priority_filter == "All Priorities":
-            visible_actions = action_center_df.copy()
+        with control_col1:
+            queue_view = st.selectbox(
+                "Queue View",
+                [
+                    "Needs Action",
+                    "All Decisions",
+                    "Protect Performance",
+                    "Optimize Soon",
+                    "Monitor Only"
+                ],
+                key="action_center_queue_view",
+                help="Needs Action hides low-priority monitor rows by default."
+            )
+
+        with control_col2:
+            analyzer_options = ["All Areas"] + sorted(
+                action_center_df["Analyzer"].dropna().astype(str).unique().tolist()
+            )
+            analyzer_filter = st.selectbox(
+                "Area",
+                analyzer_options,
+                key="action_center_area_filter"
+            )
+
+        visible_actions = action_center_df.copy()
+
+        if queue_view == "Needs Action":
+            visible_actions = visible_actions[
+                visible_actions["Priority"].isin(
+                    ["P1 - Protect Performance", "P2 - Optimize Soon"]
+                )
+            ]
+        elif queue_view == "Protect Performance":
+            visible_actions = visible_actions[
+                visible_actions["Priority"] == "P1 - Protect Performance"
+            ]
+        elif queue_view == "Optimize Soon":
+            visible_actions = visible_actions[
+                visible_actions["Priority"] == "P2 - Optimize Soon"
+            ]
+        elif queue_view == "Monitor Only":
+            visible_actions = visible_actions[
+                visible_actions["Priority"] == "P3 - Monitor / Gather Evidence"
+            ]
+
+        if analyzer_filter != "All Areas":
+            visible_actions = visible_actions[
+                visible_actions["Analyzer"] == analyzer_filter
+            ]
+
+        st.markdown("### Decision Queue")
+
+        if visible_actions.empty:
+            st.info("No decisions match the selected queue filters.")
         else:
-            visible_actions = action_center_df[
-                action_center_df["Priority"] == priority_filter
+            compact_queue = visible_actions[
+                [
+                    "Priority",
+                    "Analyzer",
+                    "Item",
+                    "Recommendation",
+                    "Evidence Strength",
+                    "Guardrail Status"
+                ]
             ].copy()
 
-        display_actions = visible_actions[
-            [
-                "Priority",
-                "Analyzer",
-                "Item",
-                "Recommendation",
-                "Evidence",
-                "Reason"
-            ]
-        ].copy()
+            compact_queue = compact_queue.rename(
+                columns={
+                    "Analyzer": "Area",
+                    "Recommendation": "Decision",
+                    "Evidence Strength": "Evidence",
+                    "Guardrail Status": "Guardrails"
+                }
+            )
 
-        st.dataframe(
-            display_actions,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Priority": st.column_config.TextColumn(
-                    "Priority",
-                    width="small"
-                ),
-                "Analyzer": st.column_config.TextColumn(
-                    "Analyzer",
-                    width="medium"
-                ),
-                "Item": st.column_config.TextColumn(
-                    "Item",
-                    width="medium"
-                ),
-                "Recommendation": st.column_config.TextColumn(
-                    "Recommendation",
-                    width="medium"
-                ),
-                "Evidence": st.column_config.TextColumn(
-                    "Evidence",
-                    width="large"
-                ),
-                "Reason": st.column_config.TextColumn(
-                    "Reason",
-                    width="large"
-                )
-            }
-        )
+            st.dataframe(
+                compact_queue,
+                use_container_width=True,
+                hide_index=True,
+                height=min(420, 42 + len(compact_queue) * 35),
+                column_config={
+                    "Priority": st.column_config.TextColumn("Priority", width="medium"),
+                    "Area": st.column_config.TextColumn("Area", width="medium"),
+                    "Item": st.column_config.TextColumn("Item", width="large"),
+                    "Decision": st.column_config.TextColumn("Decision", width="medium"),
+                    "Evidence": st.column_config.TextColumn("Evidence", width="small"),
+                    "Guardrails": st.column_config.TextColumn("Guardrails", width="small"),
+                }
+            )
 
         st.caption(
-            "P1 = act now when the existing analyzer identifies a strong "
-            "scale, pause, avoidance, or negation signal. P2 = controlled "
-            "optimization or investigation. P3 = maintain, watch, or gather "
-            "more evidence. Within each priority, higher-spend items appear first."
+            "The queue is intentionally brief. Select a decision below for the full explanation."
         )
+
+        # ---------------------------------------------------
+        # SELECT ONE DECISION TO REVIEW
+        # ---------------------------------------------------
+        selection_source = (
+            visible_actions
+            if not visible_actions.empty
+            else action_center_df
+        )
+
+        decision_labels = []
+        decision_row_indices = []
+
+        for idx, row in selection_source.iterrows():
+            decision_labels.append(
+                f"{row['Priority']}  |  {row['Analyzer']}  |  "
+                f"{row['Item']}  |  {row['Recommendation']}"
+            )
+            decision_row_indices.append(idx)
+
+        selected_label = st.selectbox(
+            "Open Decision",
+            decision_labels,
+            key="action_center_open_decision"
+        )
+
+        selected_position = decision_labels.index(selected_label)
+        selected_index = decision_row_indices[selected_position]
+        selected_decision = action_center_df.loc[selected_index]
+
+        priority_text, priority_css = _priority_guidance(
+            selected_decision["Priority"]
+        )
+
+        st.markdown(
+            f"""
+            <div class="tiq-decision-hero">
+                <div class="tiq-decision-kicker">
+                    {_html_text(selected_decision['Analyzer'])} decision brief
+                </div>
+                <div class="tiq-decision-title">
+                    {_html_text(selected_decision['Recommendation'])}
+                    — {_html_text(selected_decision['Item'])}
+                </div>
+                <div class="tiq-decision-meta">
+                    Evidence: <b>{_html_text(selected_decision['Evidence Strength'])}</b>
+                    &nbsp;•&nbsp;
+                    Guardrails: <b>{_html_text(selected_decision['Guardrail Status'])}</b>
+                    &nbsp;•&nbsp;
+                    Spend at stake: <b>{_html_text(_safe_money(selected_decision.get('_Spend', 0)))}</b>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # ---------------------------------------------------
+        # MAIN DECISION BRIEF
+        # ---------------------------------------------------
+        st.markdown(
+            f"""
+            <div class="tiq-brief-card">
+                <div class="tiq-brief-label">Signal</div>
+                <p class="tiq-brief-text">
+                    {_html_text(selected_decision.get('Signal', 'N/A'))}
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            f"""
+            <div class="tiq-brief-card">
+                <div class="tiq-brief-label">Root Cause / Interpretation</div>
+                <p class="tiq-brief-text">
+                    {_html_text(selected_decision.get('Root Cause', 'N/A'))}
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        action_steps = selected_decision.get("Action Steps", [])
+        if not isinstance(action_steps, list):
+            action_steps = [str(action_steps)]
+
+        action_html = "".join(
+            f'<div class="tiq-action-step"><b>{step_number}.</b> '
+            f'{_html_text(step)}</div>'
+            for step_number, step in enumerate(action_steps, start=1)
+        )
+
+        st.markdown(
+            f"""
+            <div class="tiq-brief-card">
+                <div class="tiq-brief-label">Action</div>
+                {action_html}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        priority_col, risk_col = st.columns([0.85, 2.15], gap="medium")
+
+        with priority_col:
+            st.markdown(
+                f"""
+                <div class="tiq-brief-card">
+                    <div class="tiq-brief-label">Priority</div>
+                    <p class="tiq-brief-text {priority_css}">
+                        {_html_text(priority_text)}
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with risk_col:
+            st.markdown(
+                f"""
+                <div class="tiq-brief-card">
+                    <div class="tiq-brief-label">Risk</div>
+                    <p class="tiq-brief-text">
+                        {_html_text(selected_decision.get('Risk Scenario', 'N/A'))}
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        st.markdown(
+            f"""
+            <div class="tiq-why-box">
+                <b>Why it matters:</b>
+                {_html_text(selected_decision.get('Why It Matters', 'N/A'))}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # ---------------------------------------------------
+        # SUPPORTING DETAIL — HIDDEN UNTIL NEEDED
+        # ---------------------------------------------------
+        evidence_tab, guardrail_tab, record_tab = st.tabs(
+            ["Decision Evidence", "Guardrails", "Record Decision"]
+        )
+
+        with evidence_tab:
+            evidence_rows = []
+
+            def add_evidence_row(metric, current, benchmark, interpretation):
+                evidence_rows.append(
+                    {
+                        "Metric": metric,
+                        "Current": current,
+                        "Benchmark / Goal": benchmark,
+                        "What it means": interpretation
+                    }
+                )
+
+            if pd.notna(selected_decision.get("Spend Share", np.nan)):
+                add_evidence_row(
+                    "Spend Share",
+                    _safe_pct(selected_decision.get("Spend Share")),
+                    "Campaign allocation",
+                    "Share of campaign spend assigned to this entity."
+                )
+
+            if funnel_stage == "Conversion":
+                if pd.notna(selected_decision.get("Conversion Share", np.nan)):
+                    add_evidence_row(
+                        "Conversion Share",
+                        _safe_pct(selected_decision.get("Conversion Share")),
+                        "Campaign contribution",
+                        "Share of campaign conversions generated by this entity."
+                    )
+
+                if pd.notna(selected_decision.get("Efficiency Index", np.nan)):
+                    add_evidence_row(
+                        "Efficiency Index",
+                        _safe_multiplier(selected_decision.get("Efficiency Index")),
+                        "1.00x campaign average",
+                        "Conversion Share divided by Spend Share."
+                    )
+
+                if pd.notna(selected_decision.get("CPA", np.nan)):
+                    add_evidence_row(
+                        "CPA",
+                        _safe_money(selected_decision.get("CPA")),
+                        (
+                            format_metric_value(primary_kpi, primary_kpi_goal)
+                            if primary_kpi == "CPA"
+                            else "Diagnostic"
+                        ),
+                        "Cost per conversion for this entity."
+                    )
+
+                if pd.notna(selected_decision.get("ROAS", np.nan)):
+                    add_evidence_row(
+                        "ROAS",
+                        _safe_multiplier(selected_decision.get("ROAS")),
+                        _safe_multiplier(roas_goal),
+                        "Attributed revenue returned per $1 of spend."
+                    )
+
+                if pd.notna(selected_decision.get("Total Conversions", np.nan)):
+                    add_evidence_row(
+                        "Conversions",
+                        format_compact_number(
+                            selected_decision.get("Total Conversions")
+                        ),
+                        "Evidence volume",
+                        "Observed conversion volume used in Evidence Strength."
+                    )
+
+            else:
+                if pd.notna(selected_decision.get("Impression Share", np.nan)):
+                    add_evidence_row(
+                        "Impression Share",
+                        _safe_pct(selected_decision.get("Impression Share")),
+                        "Campaign contribution",
+                        "Share of campaign impressions delivered by this entity."
+                    )
+
+                if pd.notna(selected_decision.get("Completion Index", np.nan)):
+                    add_evidence_row(
+                        "Completion Index",
+                        _safe_multiplier(selected_decision.get("Completion Index")),
+                        "1.00x campaign average",
+                        "Relative video completion performance."
+                    )
+
+                if pd.notna(selected_decision.get("Viewability", np.nan)):
+                    add_evidence_row(
+                        "Viewability",
+                        _safe_pct(selected_decision.get("Viewability")),
+                        (
+                            format_metric_value(secondary_kpi, secondary_kpi_goal)
+                            if secondary_kpi == "Viewability"
+                            else "Diagnostic"
+                        ),
+                        "Observed viewability for the entity."
+                    )
+
+                if pd.notna(selected_decision.get("CPM", np.nan)):
+                    add_evidence_row(
+                        "CPM",
+                        _safe_money(selected_decision.get("CPM")),
+                        "Campaign context",
+                        "Cost per thousand impressions."
+                    )
+
+            add_evidence_row(
+                "Evidence Strength",
+                str(selected_decision.get("Evidence Strength", "N/A")),
+                "Strong / Moderate / Weak",
+                "Volume, spend share, and active days supporting the decision."
+            )
+
+            evidence_df = pd.DataFrame(evidence_rows)
+            st.dataframe(
+                evidence_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            with st.expander("Methodology", expanded=False):
+                if funnel_stage == "Conversion":
+                    st.markdown(
+                        """
+                        **Evidence Strength**
+                        - Strong: Spend Share ≥ 5%, 50+ conversions, 7+ active days
+                        - Moderate: Spend Share ≥ 2%, 20+ conversions, 3+ active days
+                        - Weak: Below those floors
+
+                        **Efficiency Index**
+                        - 1.00x = conversion contribution matches spend allocation
+                        - >1.00x = conversion contribution exceeds spend allocation
+                        - <1.00x = conversion contribution trails spend allocation
+                        """
+                    )
+                else:
+                    st.markdown(
+                        """
+                        **Evidence Strength**
+                        - Strong: Spend Share ≥ 5%, 2M+ impressions, 7+ active days
+                        - Moderate: Spend Share ≥ 2%, 500K+ impressions, 3+ active days
+                        - Weak: Below those floors
+                        """
+                    )
+
+        with guardrail_tab:
+            guardrail_rows = []
+
+            primary_actual = selected_decision.get(primary_kpi, np.nan)
+            guardrail_rows.append(
+                {
+                    "Guardrail": f"Primary KPI — {primary_kpi}",
+                    "Current": (
+                        format_metric_value(primary_kpi, primary_actual)
+                        if pd.notna(primary_actual) else "N/A"
+                    ),
+                    "Goal": format_metric_value(primary_kpi, primary_kpi_goal),
+                    "Status": selected_decision.get("Primary Guardrail", "N/A")
+                }
+            )
+
+            if secondary_kpi:
+                secondary_actual = selected_decision.get(secondary_kpi, np.nan)
+                guardrail_rows.append(
+                    {
+                        "Guardrail": f"Secondary KPI — {secondary_kpi}",
+                        "Current": (
+                            format_metric_value(secondary_kpi, secondary_actual)
+                            if pd.notna(secondary_actual) else "N/A"
+                        ),
+                        "Goal": format_metric_value(
+                            secondary_kpi, secondary_kpi_goal
+                        ),
+                        "Status": selected_decision.get(
+                            "Secondary Guardrail", "N/A"
+                        )
+                    }
+                )
+
+            roas_actual = selected_decision.get("ROAS", np.nan)
+            guardrail_rows.append(
+                {
+                    "Guardrail": "ROAS",
+                    "Current": (
+                        _safe_multiplier(roas_actual)
+                        if pd.notna(roas_actual) else "N/A"
+                    ),
+                    "Goal": _safe_multiplier(roas_goal),
+                    "Status": selected_decision.get("ROAS Guardrail", "N/A")
+                }
+            )
+
+            st.dataframe(
+                pd.DataFrame(guardrail_rows),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.caption(
+                "PASS = goal met • CONDITIONAL = within the tolerance band • "
+                "FAIL = materially outside goal • NOT AVAILABLE = report cannot validate it."
+            )
+
+        with record_tab:
+            st.caption(
+                "Document the trader's final decision without leaving the Action Center."
+            )
+
+            trader_decision = st.selectbox(
+                "Trader Decision",
+                ["Accept", "Modify", "Reject"],
+                key="action_center_trader_decision"
+            )
+
+            action_taken = st.text_area(
+                "Action Taken / Planned",
+                value=(
+                    action_steps[0]
+                    if action_steps
+                    else ""
+                ),
+                height=90,
+                key="action_center_action_taken"
+            )
+
+            expected_outcome = st.text_input(
+                "Expected Outcome",
+                value=(
+                    f"Protect {primary_kpi} and ROAS while validating the recommendation."
+                ),
+                key="action_center_expected_outcome"
+            )
+
+            decision_note = st.text_area(
+                "Trader Note (optional)",
+                placeholder="Add business context, client constraints, or why you modified/rejected the recommendation.",
+                height=80,
+                key="action_center_trader_note"
+            )
+
+            save_decision = st.button(
+                "Save to Optimization Tracker",
+                type="primary",
+                use_container_width=True,
+                key="action_center_save_decision"
+            )
+
+            if save_decision:
+                optimization_log_path = "data/optimization_log.csv"
+                optimization_log_columns = [
+                    "Date", "Campaign", "Area", "Entity", "TradeIQ Recommendation",
+                    "Evidence Strength", "Guardrail Status", "Trader Decision",
+                    "Action Taken", "Decision Evidence", "Risk", "Reason",
+                    "Expected Outcome"
+                ]
+
+                try:
+                    existing_log = pd.read_csv(optimization_log_path)
+                    for column in optimization_log_columns:
+                        if column not in existing_log.columns:
+                            existing_log[column] = ""
+                    existing_log = existing_log[optimization_log_columns]
+                except (FileNotFoundError, pd.errors.EmptyDataError):
+                    existing_log = pd.DataFrame(
+                        columns=optimization_log_columns
+                    )
+
+                decision_evidence_text = (
+                    f"{selected_decision.get('Evidence Summary', '')} | "
+                    f"Signal: {selected_decision.get('Signal', '')}"
+                )
+
+                reason_text = (
+                    f"Root Cause: {selected_decision.get('Root Cause', '')}"
+                )
+                if decision_note.strip():
+                    reason_text += f" | Trader Note: {decision_note.strip()}"
+
+                new_log_row = pd.DataFrame(
+                    [
+                        {
+                            "Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+                            "Campaign": selected_campaign,
+                            "Area": selected_decision["Analyzer"],
+                            "Entity": selected_decision["Item"],
+                            "TradeIQ Recommendation": selected_decision["Recommendation"],
+                            "Evidence Strength": selected_decision["Evidence Strength"],
+                            "Guardrail Status": selected_decision["Guardrail Status"],
+                            "Trader Decision": trader_decision,
+                            "Action Taken": action_taken.strip(),
+                            "Decision Evidence": decision_evidence_text,
+                            "Risk": selected_decision.get("Risk Scenario", ""),
+                            "Reason": reason_text,
+                            "Expected Outcome": expected_outcome.strip()
+                        }
+                    ]
+                )
+
+                updated_log = pd.concat(
+                    [existing_log, new_log_row],
+                    ignore_index=True
+                )
+
+                _Path(optimization_log_path).parent.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
+                updated_log.to_csv(
+                    optimization_log_path,
+                    index=False
+                )
+
+                st.success(
+                    "Decision saved to the Optimization Tracker with the evidence "
+                    "available at decision time."
+                )
+
+        # ---------------------------------------------------
+        # OPTIONAL EXPORT — KEPT OUT OF THE MAIN DECISION FLOW
+        # ---------------------------------------------------
+        with st.expander("Export Decision Brief", expanded=False):
+            export_row = {
+                "Campaign": selected_campaign,
+                "Area": selected_decision["Analyzer"],
+                "Entity": selected_decision["Item"],
+                "Recommendation": selected_decision["Recommendation"],
+                "Priority": selected_decision["Priority"],
+                "Evidence Strength": selected_decision["Evidence Strength"],
+                "Guardrail Status": selected_decision["Guardrail Status"],
+                "Signal": selected_decision["Signal"],
+                "Root Cause / Interpretation": selected_decision["Root Cause"],
+                "Action": " | ".join(action_steps),
+                "Risk": selected_decision["Risk Scenario"],
+                "Why It Matters": selected_decision["Why It Matters"]
+            }
+
+            st.download_button(
+                "Download Decision Brief (CSV)",
+                data=pd.DataFrame([export_row]).to_csv(index=False).encode("utf-8"),
+                file_name="tradeiq_decision_brief.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
 # ---------------------------------------------------
 # END SECTION 23
@@ -6906,32 +8332,24 @@ elif page == "Optimization Action Center":
 # measurement can be layered on later.
 
 elif page == "Optimization Tracker":
-    tiq_tracker_template()
-
-
     st.markdown(
-        '<div class="section-label">Change Log / Optimization Tracker</div>',
+        '<div class="section-label">Decision Log / Optimization Tracker</div>',
         unsafe_allow_html=True
     )
 
     st.caption(
-        "Record the optimizations you make in the DSP so there is a clear "
-        "history of what changed, why it changed, and what outcome you expect."
+        "Preserve what TradeIQ knew at decision time, what the trader chose to do, "
+        "and why. The purpose is to make each optimization auditable and defensible later."
     )
 
     optimization_log_path = "data/optimization_log.csv"
     optimization_log_columns = [
-        "Date",
-        "Campaign",
-        "Area",
-        "Entity",
-        "Action Taken",
-        "Reason",
-        "Expected Outcome"
+        "Date", "Campaign", "Area", "Entity", "TradeIQ Recommendation",
+        "Evidence Strength", "Guardrail Status", "Trader Decision",
+        "Action Taken", "Decision Evidence", "Risk", "Reason", "Expected Outcome"
     ]
 
     def load_optimization_log():
-        """Load the local optimization history, or return an empty log."""
         try:
             log_df = pd.read_csv(optimization_log_path)
             for column in optimization_log_columns:
@@ -6941,268 +8359,197 @@ elif page == "Optimization Tracker":
         except (FileNotFoundError, pd.errors.EmptyDataError):
             return pd.DataFrame(columns=optimization_log_columns)
 
-
     def save_optimization_log(log_df):
-        """Persist the optimization history to the app's data folder."""
         from pathlib import Path
         Path(optimization_log_path).parent.mkdir(parents=True, exist_ok=True)
         log_df.to_csv(optimization_log_path, index=False)
 
-
     optimization_log_df = load_optimization_log()
-
     campaign_history = optimization_log_df[
         optimization_log_df["Campaign"].astype(str) == str(selected_campaign)
     ].copy()
 
     total_changes = len(campaign_history)
     latest_change = "—"
-    areas_touched = 0
-
+    accepted_decisions = 0
     if not campaign_history.empty:
         parsed_dates = pd.to_datetime(campaign_history["Date"], errors="coerce")
         if parsed_dates.notna().any():
             latest_change = parsed_dates.max().strftime("%b %d, %Y")
-        areas_touched = campaign_history["Area"].replace("", np.nan).nunique()
+        accepted_decisions = int(
+            campaign_history["Trader Decision"].astype(str).str.startswith("Accept").sum()
+        )
 
     render_tile_grid(
         [
-            {
-                "label": "Logged Changes",
-                "value": format_compact_number(total_changes),
-                "note": "For the selected campaign"
-            },
-            {
-                "label": "Areas Optimized",
-                "value": format_compact_number(areas_touched),
-                "note": "Unique trading areas"
-            },
-            {
-                "label": "Latest Change",
-                "value": latest_change,
-                "note": "Most recent logged optimization"
-            }
+            {"label": "Logged Decisions", "value": format_compact_number(total_changes), "note": "Selected campaign"},
+            {"label": "Accepted / Modified", "value": format_compact_number(accepted_decisions), "note": "Trader-owned decisions"},
+            {"label": "Latest Decision", "value": latest_change, "note": "Most recent audit record"}
         ],
         compact=True
     )
 
-    st.markdown("### Log a New Optimization")
+    st.markdown("### Record a Decision")
+    st.caption(
+        "Copy the evidence/guardrail details from the Action Center scorecard. "
+        "The trader remains the final decision maker: accept, modify, reject, or defer."
+    )
 
     available_areas = [
-        "Audience",
-        "Creative",
-        "Inventory",
-        "Domain / Website",
-        "Budget / Pacing",
-        "Bid / Base Bid",
-        "Frequency",
-        "Other"
+        "Audience", "Creative", "Inventory - Channel", "Inventory - Deal Type",
+        "Inventory - Device Type", "Domain / Website", "Budget / Pacing",
+        "Bid / Base Bid", "Frequency", "Other"
     ]
-
+    trader_decisions = [
+        "Accept Recommendation", "Accept with Modification",
+        "Reject Recommendation", "Defer / Gather More Data"
+    ]
     action_options = [
-        "Increased Allocation",
-        "Reduced Allocation",
-        "Increased Bid",
-        "Reduced Bid",
-        "Paused",
-        "Activated",
-        "Excluded / Negated",
-        "Added / Included",
-        "Refreshed Creative",
-        "Adjusted Frequency",
-        "Other"
+        "No Change Yet", "Increased Allocation", "Reduced Allocation",
+        "Increased Bid", "Reduced Bid", "Paused", "Activated",
+        "Excluded / Negated", "Added / Included", "Refreshed Creative",
+        "Adjusted Frequency", "Other"
+    ]
+    recommendation_options = [
+        "SCALE", "PRIORITIZE", "CONTROLLED TEST",
+        "DO NOT SCALE - GUARDRAIL FAILED", "GATHER MORE DATA",
+        "NEGATION CANDIDATE", "PAUSE CANDIDATE", "AVOID / REDUCE",
+        "REDUCE", "REDUCE / INVESTIGATE", "REFRESH / REDUCE",
+        "INVESTIGATE", "INVESTIGATE - MORE DATA NEEDED", "MAINTAIN", "WATCH", "Other"
     ]
 
     with st.form("optimization_tracker_form", clear_on_submit=True):
-        form_col1, form_col2 = st.columns(2)
+        col1, col2 = st.columns(2)
+        with col1:
+            optimization_date = st.date_input("Decision Date", value=pd.Timestamp.today().date())
+            optimization_area = st.selectbox("Analyzer / Area", available_areas)
+            optimization_entity = st.text_input("Entity", placeholder="e.g., Auto Intenders")
+            tradeiq_recommendation = st.selectbox("TradeIQ Recommendation", recommendation_options)
+            evidence_strength = st.selectbox("Evidence Strength", ["Strong", "Moderate", "Weak"])
+            guardrail_status = st.selectbox("Guardrail Status", ["Passed", "Conditional", "Failed", "Incomplete"])
 
-        with form_col1:
-            optimization_date = st.date_input(
-                "Date",
-                value=pd.Timestamp.today().date()
+        with col2:
+            trader_decision = st.selectbox("Trader Decision", trader_decisions)
+            optimization_action = st.selectbox("Action Taken", action_options)
+            decision_evidence = st.text_area(
+                "Decision Evidence",
+                placeholder="Paste the scorecard signal + KPI/guardrail evidence used at decision time.",
+                height=95
             )
-
-            optimization_area = st.selectbox(
-                "Analyzer / Area",
-                available_areas
+            optimization_risk = st.text_area(
+                "Risk / What could make this wrong",
+                placeholder="e.g., evidence is moderate; CPA may deteriorate if spend expands.",
+                height=80
             )
-
-            optimization_entity = st.text_input(
-                "Entity",
-                placeholder="e.g., Auto Intenders, Video 15s, example.com"
-            )
-
-        with form_col2:
-            optimization_action = st.selectbox(
-                "Action Taken",
-                action_options
-            )
-
             optimization_reason = st.text_area(
-                "Reason",
-                placeholder="Why was this optimization made?",
-                height=90
+                "Trader Rationale",
+                placeholder="Why did you accept, modify, reject, or defer the recommendation?",
+                height=80
             )
-
             optimization_outcome = st.text_area(
                 "Expected Outcome",
-                placeholder="e.g., Reduce CPA while maintaining conversion volume",
-                height=90
+                placeholder="e.g., Improve CPA while maintaining ROAS and viewability guardrails.",
+                height=80
             )
 
-        submitted_optimization = st.form_submit_button(
-            "Save Optimization",
-            use_container_width=True
-        )
+        submitted_optimization = st.form_submit_button("Save Decision Record", use_container_width=True)
 
     if submitted_optimization:
         missing_fields = []
-
-        if not optimization_entity.strip():
-            missing_fields.append("Entity")
-        if not optimization_reason.strip():
-            missing_fields.append("Reason")
-        if not optimization_outcome.strip():
-            missing_fields.append("Expected Outcome")
+        for label, value in [
+            ("Entity", optimization_entity),
+            ("Decision Evidence", decision_evidence),
+            ("Trader Rationale", optimization_reason),
+            ("Expected Outcome", optimization_outcome)
+        ]:
+            if not str(value).strip():
+                missing_fields.append(label)
 
         if missing_fields:
-            st.error(
-                "Please complete: " + ", ".join(missing_fields) + "."
-            )
+            st.error("Please complete: " + ", ".join(missing_fields) + ".")
         else:
-            new_optimization = pd.DataFrame(
-                [{
-                    "Date": optimization_date.strftime("%Y-%m-%d"),
-                    "Campaign": selected_campaign,
-                    "Area": optimization_area,
-                    "Entity": optimization_entity.strip(),
-                    "Action Taken": optimization_action,
-                    "Reason": optimization_reason.strip(),
-                    "Expected Outcome": optimization_outcome.strip()
-                }]
-            )
-
-            optimization_log_df = pd.concat(
-                [optimization_log_df, new_optimization],
-                ignore_index=True
-            )
-
+            new_record = pd.DataFrame([{
+                "Date": optimization_date.strftime("%Y-%m-%d"),
+                "Campaign": selected_campaign,
+                "Area": optimization_area,
+                "Entity": optimization_entity.strip(),
+                "TradeIQ Recommendation": tradeiq_recommendation,
+                "Evidence Strength": evidence_strength,
+                "Guardrail Status": guardrail_status,
+                "Trader Decision": trader_decision,
+                "Action Taken": optimization_action,
+                "Decision Evidence": decision_evidence.strip(),
+                "Risk": optimization_risk.strip(),
+                "Reason": optimization_reason.strip(),
+                "Expected Outcome": optimization_outcome.strip()
+            }])
+            optimization_log_df = pd.concat([optimization_log_df, new_record], ignore_index=True)
             try:
                 save_optimization_log(optimization_log_df)
-                st.success("Optimization saved to the change log.")
+                st.success("Decision record saved to the audit log.")
                 st.rerun()
             except Exception as error:
-                st.error(f"Unable to save the optimization log: {error}")
+                st.error(f"Unable to save the decision log: {error}")
 
-    st.markdown("### Optimization History")
-
+    st.markdown("### Decision History")
     optimization_log_df = load_optimization_log()
     campaign_history = optimization_log_df[
         optimization_log_df["Campaign"].astype(str) == str(selected_campaign)
     ].copy()
 
     if campaign_history.empty:
-        st.info(
-            "No optimizations have been logged for this campaign yet. "
-            "Use the form above to record the first change."
-        )
+        st.info("No decision records have been logged for this campaign yet.")
     else:
-        history_col1, history_col2 = st.columns([1, 1])
-
-        with history_col1:
+        filter_col1, filter_col2 = st.columns(2)
+        with filter_col1:
             area_filter_options = ["All Areas"] + sorted(
                 campaign_history["Area"].dropna().astype(str).unique().tolist()
             )
-            history_area_filter = st.selectbox(
-                "Area Filter",
-                area_filter_options,
-                key="optimization_history_area_filter"
-            )
-
-        with history_col2:
+            history_area_filter = st.selectbox("Area Filter", area_filter_options, key="optimization_history_area_filter")
+        with filter_col2:
             history_search = st.text_input(
                 "Search History",
-                placeholder="Search entity, action, reason, or outcome",
+                placeholder="Search entity, recommendation, evidence, rationale, or outcome",
                 key="optimization_history_search"
             )
 
         visible_history = campaign_history.copy()
-
         if history_area_filter != "All Areas":
-            visible_history = visible_history[
-                visible_history["Area"] == history_area_filter
-            ]
-
+            visible_history = visible_history[visible_history["Area"] == history_area_filter]
         if history_search.strip():
             search_text = history_search.strip().lower()
             searchable_columns = [
-                "Entity",
-                "Action Taken",
-                "Reason",
-                "Expected Outcome"
+                "Entity", "TradeIQ Recommendation", "Trader Decision", "Action Taken",
+                "Decision Evidence", "Risk", "Reason", "Expected Outcome"
             ]
             search_mask = pd.Series(False, index=visible_history.index)
             for column in searchable_columns:
                 search_mask = search_mask | (
-                    visible_history[column]
-                    .fillna("")
-                    .astype(str)
-                    .str.lower()
-                    .str.contains(search_text, regex=False)
+                    visible_history[column].fillna("").astype(str).str.lower().str.contains(search_text, regex=False)
                 )
             visible_history = visible_history[search_mask]
 
-        visible_history["_Date_Sort"] = pd.to_datetime(
-            visible_history["Date"],
-            errors="coerce"
-        )
-        visible_history = visible_history.sort_values(
-            "_Date_Sort",
-            ascending=False
-        )
-
+        visible_history["_Date_Sort"] = pd.to_datetime(visible_history["Date"], errors="coerce")
+        visible_history = visible_history.sort_values("_Date_Sort", ascending=False)
         history_display = visible_history[
             [
-                "Date",
-                "Area",
-                "Entity",
-                "Action Taken",
-                "Reason",
-                "Expected Outcome"
+                "Date", "Area", "Entity", "TradeIQ Recommendation", "Evidence Strength",
+                "Guardrail Status", "Trader Decision", "Action Taken", "Decision Evidence",
+                "Risk", "Reason", "Expected Outcome"
             ]
         ].copy()
 
-        st.dataframe(
-            history_display,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Date": st.column_config.TextColumn("Date", width="small"),
-                "Area": st.column_config.TextColumn("Area", width="medium"),
-                "Entity": st.column_config.TextColumn("Entity", width="medium"),
-                "Action Taken": st.column_config.TextColumn("Action Taken", width="medium"),
-                "Reason": st.column_config.TextColumn("Reason", width="large"),
-                "Expected Outcome": st.column_config.TextColumn("Expected Outcome", width="large")
-            }
-        )
-
+        st.dataframe(history_display, use_container_width=True, hide_index=True)
         st.download_button(
-            "Download Optimization History",
+            "Download Decision History",
             data=history_display.to_csv(index=False).encode("utf-8"),
-            file_name=(
-                str(selected_campaign)
-                .replace(" ", "_")
-                .replace("/", "-")
-                + "_optimization_history.csv"
-            ),
+            file_name=str(selected_campaign).replace(" ", "_").replace("/", "-") + "_decision_history.csv",
             mime="text/csv",
             use_container_width=True
         )
-
         st.caption(
-            "The log is stored locally in data/optimization_log.csv. "
-            "Each campaign has its own filtered history while all changes are "
-            "kept in the same log file."
+            "The audit log stores the evidence and trader rationale that existed when the decision was made. "
+            "This makes later review possible even if campaign performance changes afterward."
         )
 
 # ---------------------------------------------------
@@ -7226,3 +8573,6 @@ elif page == "Inventory Analyzer":
 elif page == "Domain / Website Analyzer":
     render_clean_analyzer("Domain / Website", "Site_Domain", "domain")
 
+
+elif page == "Pacing & Delivery Analyzer":
+    render_pacing_delivery_analyzer()
