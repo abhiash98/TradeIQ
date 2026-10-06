@@ -3352,6 +3352,13 @@ def calculate_specialized_dimension_recommendations(
         100
     )
 
+    # Creative-specific response signals: VCR, CTR, and CPM.
+    if analyzer_type == "creative":
+        result["VCR"] = result["Completion Rate"]
+        result["VCR Index"] = safe_divide(result["VCR"], completion_rate)
+        result["CTR Index"] = safe_divide(result["CTR"], ctr)
+        result["CPM Efficiency"] = safe_divide(cpm, result["CPM"])
+
     # ---------------------------------------------------
     # Conversion objective
     # ---------------------------------------------------
@@ -3818,6 +3825,35 @@ def calculate_specialized_dimension_recommendations(
         result["Recommendation"] = "Not Evaluated"
         result["Confidence"] = "Low"
         result["Reason"] = "Campaign funnel stage is not assigned."
+
+    # Creative recommendations must be supported by the asset's own response signals.
+    if analyzer_type == "creative" and funnel_stage in {"Conversion", "Awareness"}:
+        revised=[]
+        revised_reasons=[]
+        for _, row in result.iterrows():
+            rec=str(row.get("Recommendation", "WATCH"))
+            reason=str(row.get("Reason", ""))
+            vals=[row.get("VCR Index",np.nan),row.get("CTR Index",np.nan),row.get("CPM Efficiency",np.nan)]
+            vals=[float(v) for v in vals if pd.notna(v) and np.isfinite(float(v))]
+            strong=sum(v>=1.05 for v in vals)
+            weak=sum(v<0.90 for v in vals)
+            if len(vals)>=2:
+                if rec in {"SCALE","PRIORITIZE"} and strong<2:
+                    rec="WATCH"
+                    reason += " Creative scale is not confirmed by at least two of VCR, CTR, and CPM efficiency."
+                elif rec in {"PAUSE CANDIDATE","REFRESH / REDUCE","REDUCE"} and weak<2:
+                    rec="INVESTIGATE"
+                    reason += " Creative weakness is not confirmed by at least two of VCR, CTR, and CPM efficiency."
+                elif rec in {"WATCH","MAINTAIN"} and weak>=2:
+                    rec="REFRESH / REDUCE"
+                    reason += " At least two creative-response signals are below 0.90x campaign average."
+                elif rec in {"WATCH","MAINTAIN"} and strong>=2:
+                    rec="MAINTAIN"
+                    reason += " At least two creative-response signals are at or above 1.05x campaign average."
+            revised.append(rec)
+            revised_reasons.append(reason)
+        result["Recommendation"]=revised
+        result["Reason"]=revised_reasons
 
     result = apply_decision_support(result, analyzer_type)
     return result
@@ -5629,13 +5665,32 @@ def _ca_agg(d,dim):
     for c in ["Spend_USD","Impressions_Served","Impressions_Viewable","Clicks","Conv_View_Through","Conv_Click_Through","Revenue_Attributed_USD"]:
         if c not in d.columns:d[c]=0.0
         d[c]=pd.to_numeric(d[c],errors="coerce").fillna(0)
+
+    # VCR / Completion Rate is kept as NaN when unavailable so a non-video
+    # creative is not incorrectly treated as having a 0% completion rate.
+    if "Completion_Rate_%" not in d.columns:
+        d["Completion_Rate_%"]=np.nan
+    d["Completion_Rate_%"]=pd.to_numeric(d["Completion_Rate_%"],errors="coerce")
+    d["_VCR_Weighted"]=np.where(
+        d["Completion_Rate_%"].notna() & (d["Impressions_Served"]>0),
+        d["Completion_Rate_%"]*d["Impressions_Served"],
+        0.0
+    )
+    d["_VCR_Impressions"]=np.where(
+        d["Completion_Rate_%"].notna() & (d["Impressions_Served"]>0),
+        d["Impressions_Served"],
+        0.0
+    )
+
     d[dim]=d[dim].fillna("Not Available").astype(str)
     d=d[~d[dim].str.strip().str.lower().isin(["","none","nan","not available"])]
     g=d.groupby(dim,dropna=False).agg(
         Spend=("Spend_USD","sum"),Impressions=("Impressions_Served","sum"),
         Viewable=("Impressions_Viewable","sum"),Clicks=("Clicks","sum"),
         VTC=("Conv_View_Through","sum"),CTC=("Conv_Click_Through","sum"),
-        Revenue=("Revenue_Attributed_USD","sum")).reset_index()
+        Revenue=("Revenue_Attributed_USD","sum"),
+        VCR_Weighted=("_VCR_Weighted","sum"),
+        VCR_Impressions=("_VCR_Impressions","sum")).reset_index()
     g["Conversions"]=g["VTC"]+g["CTC"]
     ts=g["Spend"].sum();tc=g["Conversions"].sum()
     g["Spend Share"]=np.where(ts>0,g["Spend"]/ts*100,0)
@@ -5647,6 +5702,9 @@ def _ca_agg(d,dim):
     g["Conversion Rate"]=np.where(g["Clicks"]>0,g["CTC"]/g["Clicks"]*100,np.nan)
     g["ROAS"]=np.where(g["Spend"]>0,g["Revenue"]/g["Spend"],np.nan)
     g["Viewability"]=np.where(g["Impressions"]>0,g["Viewable"]/g["Impressions"]*100,np.nan)
+    g["VCR"]=np.where(g["VCR_Impressions"]>0,g["VCR_Weighted"]/g["VCR_Impressions"],np.nan)
+    # Keep the canonical name too so existing campaign-KPI logic continues to work.
+    g["Completion Rate"]=g["VCR"]
     g["Efficiency Index"]=np.where(g["Spend Share"]>0,g["Conversion Share"]/g["Spend Share"],np.nan)
     return g
 
@@ -5666,6 +5724,78 @@ def _ca_decision(r):
     if good and sok:return "MAINTAIN"
     return "WATCH"
 
+
+def _ca_add_creative_signals(g):
+    """Add campaign-relative VCR, CTR, and CPM signals for creative analysis."""
+    g=g.copy()
+    total_impressions=g["Impressions"].sum()
+    total_clicks=g["Clicks"].sum()
+    total_spend=g["Spend"].sum()
+    total_vcr_impressions=g.get("VCR_Impressions",pd.Series(0,index=g.index)).sum()
+    total_vcr_weighted=g.get("VCR_Weighted",pd.Series(0,index=g.index)).sum()
+
+    campaign_ctr=(total_clicks/total_impressions*100) if total_impressions>0 else np.nan
+    campaign_cpm=(total_spend/total_impressions*1000) if total_impressions>0 else np.nan
+    campaign_vcr=(total_vcr_weighted/total_vcr_impressions) if total_vcr_impressions>0 else np.nan
+
+    g["VCR Index"]=np.where(
+        pd.notna(campaign_vcr) & (campaign_vcr>0) & g["VCR"].notna(),
+        g["VCR"]/campaign_vcr,
+        np.nan
+    )
+    g["CTR Index"]=np.where(
+        pd.notna(campaign_ctr) & (campaign_ctr>0) & g["CTR"].notna(),
+        g["CTR"]/campaign_ctr,
+        np.nan
+    )
+    g["CPM Efficiency"]=np.where(
+        pd.notna(campaign_cpm) & (campaign_cpm>0) & g["CPM"].notna() & (g["CPM"]>0),
+        campaign_cpm/g["CPM"],
+        np.nan
+    )
+    return g
+
+
+def _ca_creative_signal_counts(r):
+    """Return available/strong/weak counts across VCR, CTR and CPM creative signals."""
+    values=[r.get("VCR Index",np.nan),r.get("CTR Index",np.nan),r.get("CPM Efficiency",np.nan)]
+    available=[float(v) for v in values if pd.notna(v) and np.isfinite(float(v))]
+    strong=sum(v>=1.05 for v in available)
+    weak=sum(v<0.90 for v in available)
+    return len(available),strong,weak
+
+
+def _ca_creative_decision(r):
+    """
+    Creative recommendation = configured campaign KPI/ROAS outcome + creative response quality.
+    VCR, CTR and CPM must support a scale/reduce decision when at least two signals exist.
+    """
+    base=_ca_decision(r)
+    available,strong,weak=_ca_creative_signal_counts(r)
+
+    # With fewer than two creative-quality signals, preserve the existing KPI decision.
+    if available<2:
+        return base
+
+    # Scale only when the conversion/business outcome AND the creative response agree.
+    if base=="SCALE":
+        return "SCALE" if strong>=2 else "WATCH"
+
+    # Do not blame the creative for weak CPA/ROAS when its own response metrics are healthy.
+    if base=="REDUCE / INVESTIGATE":
+        return "REDUCE / INVESTIGATE" if weak>=2 else "WATCH"
+
+    # A clearly weak creative can still deserve investigation even before CPA/ROAS fully deteriorate.
+    if weak>=2:
+        return "REDUCE / INVESTIGATE"
+
+    # Strong VCR/CTR/CPM supports maintaining the asset, but not scaling without KPI support.
+    if strong>=2 and base in {"MAINTAIN","WATCH"}:
+        return "MAINTAIN"
+
+    return base
+
+
 def render_clean_analyzer(label,dim,prefix):
     st.markdown(f'<div class="section-label">{label} Analyzer</div>',unsafe_allow_html=True)
     st.caption(f"Focus on the {label.lower()} signals that matter for optimization.")
@@ -5677,7 +5807,11 @@ def render_clean_analyzer(label,dim,prefix):
 
     g=_ca_agg(_ca_period(prefix),dim)
     if g.empty:st.warning("No usable data exists for the selected period.");return
-    g["Decision"]=g.apply(_ca_decision,axis=1)
+    if prefix=="creative":
+        g=_ca_add_creative_signals(g)
+        g["Decision"]=g.apply(_ca_creative_decision,axis=1)
+    else:
+        g["Decision"]=g.apply(_ca_decision,axis=1)
 
     spend=g["Spend"].sum();conv=g["Conversions"].sum();rev=g["Revenue"].sum()
     imps=g["Impressions"].sum();clicks=g["Clicks"].sum();view=g["Viewable"].sum()
@@ -5710,11 +5844,22 @@ def render_clean_analyzer(label,dim,prefix):
             best=candidates.loc[candidates[primary_kpi].idxmin()] if primary_kpi in {"CPA","CPM","CPC"} else candidates.loc[candidates[primary_kpi].idxmax()]
         else:best=candidates.loc[candidates["Efficiency Index"].fillna(-1).idxmax()]
         st.markdown('<div class="tiq-section">Top Opportunity</div>',unsafe_allow_html=True)
+        if prefix=="creative":
+            creative_signal_text=(
+                f"VCR: {tiq_value_fmt('VCR',best.get('VCR',np.nan))} • "
+                f"CTR: {tiq_value_fmt('CTR',best.get('CTR',np.nan))} • "
+                f"CPM: {tiq_value_fmt('CPM',best.get('CPM',np.nan))}"
+            )
+        else:
+            creative_signal_text=f"Efficiency Index: {best.get('Efficiency Index',np.nan):.2f}"
         st.markdown(f"""<div class="tiq-callout tiq-strong"><h4>{best[dim]} — {best['Decision']}</h4>
-        <p>{primary_kpi}: {tiq_value_fmt(primary_kpi,best.get(primary_kpi,np.nan))} • ROAS: {tiq_value_fmt('ROAS',best.get('ROAS',np.nan))} • Efficiency Index: {best.get('Efficiency Index',np.nan):.2f}</p></div>""",unsafe_allow_html=True)
+        <p>{primary_kpi}: {tiq_value_fmt(primary_kpi,best.get(primary_kpi,np.nan))} • ROAS: {tiq_value_fmt('ROAS',best.get('ROAS',np.nan))} • {creative_signal_text}</p></div>""",unsafe_allow_html=True)
 
         st.markdown('<div class="tiq-section">Performance Chart</div>',unsafe_allow_html=True)
-        metric=st.selectbox("Chart Metric",list(dict.fromkeys([primary_kpi,"ROAS","Spend","Viewability","Efficiency Index"])),key=f"{prefix}_clean_chart")
+        chart_metrics=[primary_kpi,"ROAS","Spend","Viewability","Efficiency Index"]
+        if prefix=="creative":
+            chart_metrics=[primary_kpi,"ROAS","VCR","CTR","CPM","VCR Index","CTR Index","CPM Efficiency","Spend","Efficiency Index"]
+        metric=st.selectbox("Chart Metric",list(dict.fromkeys(chart_metrics)),key=f"{prefix}_clean_chart")
         cd=g[[dim,metric]].dropna().sort_values(metric,ascending=metric in {"CPA","CPM","CPC"}).head(20)
         chart=alt.Chart(cd).mark_bar().encode(
             y=alt.Y(f"{dim}:N",title=label,sort="-x"),x=alt.X(f"{metric}:Q",title=metric),
@@ -5725,10 +5870,14 @@ def render_clean_analyzer(label,dim,prefix):
     with performance:
         st.markdown('<div class="tiq-section">Decision Table</div>',unsafe_allow_html=True)
         cols=[dim,"Spend",primary_kpi,"ROAS","Efficiency Index","Decision"]
+        if prefix=="creative":
+            cols=[dim,"Spend",primary_kpi,"ROAS","VCR","CTR","CPM","VCR Index","CTR Index","CPM Efficiency","Efficiency Index","Decision"]
         if secondary_kpi and secondary_kpi in g.columns and secondary_kpi not in cols:cols.insert(-2,secondary_kpi)
         st.dataframe(g[cols].sort_values(primary_kpi,ascending=primary_kpi in {"CPA","CPM","CPC"}),hide_index=True,use_container_width=True)
         with st.expander("View Detailed Metrics"):
             detail=[dim,"Spend","Spend Share","Impressions","CPM","Clicks","CTR","Conversions","Conversion Share","CPA","ROAS","Viewability","Conversion Rate","Efficiency Index","Decision"]
+            if prefix=="creative":
+                detail=[dim,"Spend","Spend Share","Impressions","VCR","VCR Index","CPM","CPM Efficiency","Clicks","CTR","CTR Index","Conversions","Conversion Share","CPA","ROAS","Viewability","Conversion Rate","Efficiency Index","Decision"]
             st.dataframe(g[[c for c in detail if c in g.columns]],hide_index=True,use_container_width=True)
 
     with insights:
@@ -5742,11 +5891,35 @@ def render_clean_analyzer(label,dim,prefix):
                     "REDUCE / INVESTIGATE":"Investigate performance drivers and consider reducing exposure.",
                     "WATCH":"Keep allocation stable and monitor for a clearer signal.",
                     "MAINTAIN":"Maintain current allocation unless priorities change."}[dec]
+            if prefix=="creative":
+                signal_line=(
+                    f"VCR: {tiq_value_fmt('VCR',r.get('VCR',np.nan))} "
+                    f"({r.get('VCR Index',np.nan):.2f}x) • "
+                    f"CTR: {tiq_value_fmt('CTR',r.get('CTR',np.nan))} "
+                    f"({r.get('CTR Index',np.nan):.2f}x) • "
+                    f"CPM: {tiq_value_fmt('CPM',r.get('CPM',np.nan))} "
+                    f"({r.get('CPM Efficiency',np.nan):.2f}x efficiency)"
+                )
+            else:
+                signal_line=f"Spend Share: {r.get('Spend Share',0):.1f}% • Conversion Share: {r.get('Conversion Share',0):.1f}%"
             st.markdown(f"""<div class="tiq-callout {css}"><h4>{r[dim]} — {dec}</h4>
-            <p>{primary_kpi}: {tiq_value_fmt(primary_kpi,r.get(primary_kpi,np.nan))} • ROAS: {tiq_value_fmt('ROAS',r.get('ROAS',np.nan))} • Spend Share: {r.get('Spend Share',0):.1f}% • Conversion Share: {r.get('Conversion Share',0):.1f}%</p>
+            <p>{primary_kpi}: {tiq_value_fmt(primary_kpi,r.get(primary_kpi,np.nan))} • ROAS: {tiq_value_fmt('ROAS',r.get('ROAS',np.nan))} • {signal_line}</p>
             <p><b>Action:</b> {action}</p></div>""",unsafe_allow_html=True)
         with st.expander("Evidence & Decision Logic"):
-            st.markdown(f"""TradeIQ prioritizes **{primary_kpi}** as the decision KPI.
+            if prefix=="creative":
+                st.markdown(f"""TradeIQ still protects the configured **{primary_kpi}** and **ROAS** goals, but Creative recommendations now also require the asset's own response signals.
+
+**Creative decision signals**
+- **VCR Index** = Creative VCR ÷ selected-period campaign VCR
+- **CTR Index** = Creative CTR ÷ selected-period campaign CTR
+- **CPM Efficiency** = selected-period campaign CPM ÷ Creative CPM
+- **Strong signal:** index ≥ 1.05x
+- **Weak signal:** index < 0.90x
+- At least **2 available creative signals** must agree before they upgrade or downgrade a recommendation.
+
+A creative is not scaled only because CPA/ROAS look good, and it is not blamed for weak CPA/ROAS when VCR/CTR/CPM indicate the asset itself is healthy.""")
+            else:
+                st.markdown(f"""TradeIQ prioritizes **{primary_kpi}** as the decision KPI.
 {f'**{secondary_kpi}** is used as a quality guardrail.' if secondary_kpi else ''}
 **ROAS** is evaluated independently. **Efficiency Index = Conversion Share ÷ Spend Share.**""")
 # ---------------------------------------------------
@@ -7498,6 +7671,10 @@ elif page == "Optimization Action Center":
             evidence_parts.append(
                 f"ROAS {_safe_multiplier(row.get('ROAS', np.nan))}"
             )
+            if analyzer_type == "creative":
+                evidence_parts.append(f"VCR {_safe_multiplier(row.get('VCR Index', np.nan))}")
+                evidence_parts.append(f"CTR {_safe_multiplier(row.get('CTR Index', np.nan))}")
+                evidence_parts.append(f"CPM Eff {_safe_multiplier(row.get('CPM Efficiency', np.nan))}")
         else:
             evidence_parts.append(
                 f"Completion {_safe_multiplier(row.get('Completion Index', np.nan))}"
@@ -7562,7 +7739,8 @@ elif page == "Optimization Action Center":
             "Why It Matters", "Evidence Summary", "_Spend",
             "Spend Share", "Conversion Share", "Impression Share",
             "Efficiency Index", "CPA", "ROAS", "Total Conversions",
-            "Completion Rate", "Completion Index", "Viewability",
+            "Completion Rate", "Completion Index", "VCR", "VCR Index",
+            "CTR", "CTR Index", "Viewability",
             "Viewability Index", "CPM", "CPM Efficiency",
             "Active_Days", "Data_Quality_Warnings"
         ]
